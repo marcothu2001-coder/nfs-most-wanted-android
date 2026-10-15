@@ -1,0 +1,49 @@
+name: Build Android APK (NFS Most Wanted Native)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Permite disparar a compilação manualmente com 1 clique no GitHub
+
+jobs:
+  build:
+    name: Compilar APK com Android NDK e C++17
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 4. Instalar NDK (r25c) e CMake pelo SDKManager
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager --install "ndk;25.2.9519653" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: 5. Criar script Gradle Wrapper se necessário
+        run: |
+          cd android
+          gradle wrapper
+
+      - name: 6. Compilar o APK Nativo (Debug)
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: 7. Publicar o APK como Artefato de Download
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFS-Most-Wanted-Debug-APK
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14

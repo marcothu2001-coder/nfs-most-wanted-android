@@ -1,0 +1,31 @@
+# Arquivos de imagem de disco e grandes binários do jogo (>100MB não cabem no GitHub)
+*.iso
+*.ISO
+need/
+*.BIN
+*.bin
+*.BUN
+*.bun
+*.IMG
+*.img
+SLUS_213.51
+
+# Diretórios de compilação
+build/
+.cxx/
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+*.o
+*.so
+*.a
+*.obj
+*.exe
+*.apk
+
+# Arquivos temporários do Python e do SO
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
