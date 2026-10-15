@@ -3,9 +3,13 @@ name: Build Android APK (NFS Most Wanted Native)
 on:
   push:
     branches: [ "main", "master" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch: # Permite disparar a compilação manualmente com 1 clique no GitHub
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -33,7 +37,9 @@ jobs:
       - name: 5. Criar script Gradle Wrapper se necessário
         run: |
           cd android
-          gradle wrapper
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper
+          fi
 
       - name: 6. Compilar o APK Nativo (Debug)
         run: |
@@ -47,3 +53,11 @@ jobs:
           name: NFS-Most-Wanted-Debug-APK
           path: android/app/build/outputs/apk/debug/*.apk
           retention-days: 14
+
+      - name: 8. Criar Release Oficial no GitHub (se disparado por tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: android/app/build/outputs/apk/debug/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
