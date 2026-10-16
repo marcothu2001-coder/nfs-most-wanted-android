@@ -62,8 +62,16 @@ jobs:
           # Alinhamento de 4 bytes para suporte a mmap de alta performance no Android
           $BUILD_TOOLS/zipalign -f -p 4 android/app/build/outputs/apk/debug/app-debug.apk android/app/build/outputs/apk/debug/app-aligned.apk
           
-          # Assinar com debug keystore oficial
-          $BUILD_TOOLS/apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android --key-pass pass:android --out android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk android/app/build/outputs/apk/debug/app-aligned.apk
+          # Garantir que a debug keystore exista (gerar com keytool se necessário)
+          KEYSTORE="$HOME/.android/debug.keystore"
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "Criando debug keystore oficial com keytool..."
+            mkdir -p "$HOME/.android"
+            keytool -genkey -v -keystore "$KEYSTORE" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          
+          # Assinar com debug keystore oficial (v1, v2 e v3)
+          $BUILD_TOOLS/apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey --out android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk android/app/build/outputs/apk/debug/app-aligned.apk
           
           # Verificar a integridade da assinatura
           $BUILD_TOOLS/apksigner verify --verbose android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk
