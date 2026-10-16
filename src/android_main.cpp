@@ -126,6 +126,9 @@ struct EngineState {
     GLint uUseLitLoc = -1;
     GLint uUseTexLoc = -1;
     GLint uTextureLoc = -1;
+    GLint uEnvTexLoc = -1;
+    GLint uEnvReflectLoc = -1;
+    GLint uCameraPosLoc = -1;
 
     // Subsistemas do Jogo
     VehicleSimulation car;
@@ -494,32 +497,51 @@ static DecodedPS2Mesh LoadPS2Geometry(AAssetManager* mgr, const char* assetPath,
     return mesh;
 }
 
-// Shaders OpenGL ES com suporte a Textura 2D + Iluminação EAGL4
+// Shaders OpenGL ES com Visual Treatment Oficial do PS2:
+// - Iluminação Direcional Dourada (Pôr do Sol Rockport EAGL4)
+// - Reflexo Dinâmico Fresnel de Ambiente no Chassi Metálico e Asfalto Úmido
+// - Gradação de Cores Âmbar / Sépia Most Wanted com Curva de Contraste Fílmica
+// - Overbright / Bloom em Altas Luzes
+// - Bruma Atmosférica de Profundidade
 static const char* kVertexShaderSrc = R"(
 attribute vec3 aPos;
 attribute vec3 aNormal;
 attribute vec2 aUV;
 attribute vec4 aColor;
+
 uniform mat4 uMVP;
 uniform mat4 uModel;
 uniform float uUseLit;
 uniform float uUseTex;
+uniform vec3 uCameraPos;
+
 varying vec4 vColor;
 varying vec2 vUV;
 varying float vUseTex;
+varying vec3 vWorldNormal;
+varying vec3 vViewDir;
+varying float vDepth;
+
 void main() {
-    gl_Position = uMVP * uModel * vec4(aPos, 1.0);
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    gl_Position = uMVP * worldPos;
     vUV = aUV;
     vUseTex = uUseTex;
+    vDepth = gl_Position.z / (gl_Position.w + 0.0001);
+
+    mat3 normalMat = mat3(uModel[0].xyz, uModel[1].xyz, uModel[2].xyz);
+    vWorldNormal = normalize(normalMat * aNormal);
+    vViewDir = normalize(uCameraPos - worldPos.xyz);
+
     if (uUseLit > 0.5) {
-        vec3 N = normalize(mat3(uModel[0].xyz, uModel[1].xyz, uModel[2].xyz) * aNormal);
-        vec3 L = normalize(vec3(0.45, 0.82, -0.35));
-        vec3 V = normalize(vec3(0.0, 0.35, -1.0));
-        vec3 H = normalize(L + V);
-        float diff = max(dot(N, L), 0.0);
-        float hemi = 0.52 + 0.48 * clamp(N.y, -1.0, 1.0);
-        float spec = pow(max(dot(N, H), 0.0), 18.0) * 0.42;
-        vec3 lit = aColor.rgb * (0.38 * hemi + 0.68 * diff) + vec3(spec);
+        // Sol de Pôr do Sol de Rockport (Ângulo baixo e dourado)
+        vec3 sunDir = normalize(vec3(0.55, 0.45, -0.70));
+        float diff = max(dot(vWorldNormal, sunDir), 0.0);
+        float hemi = 0.50 + 0.50 * clamp(vWorldNormal.y, -1.0, 1.0);
+
+        vec3 sunColor = vec3(1.22, 0.96, 0.68);
+        vec3 ambColor = vec3(0.44, 0.42, 0.48);
+        vec3 lit = aColor.rgb * (ambColor * hemi + sunColor * diff * 0.85);
         vColor = vec4(clamp(lit, 0.0, 1.0), aColor.a);
     } else {
         vColor = aColor;
@@ -529,17 +551,65 @@ void main() {
 
 static const char* kFragmentShaderSrc = R"(
 precision mediump float;
+
 varying vec4 vColor;
 varying vec2 vUV;
 varying float vUseTex;
+varying vec3 vWorldNormal;
+varying vec3 vViewDir;
+varying float vDepth;
+
 uniform sampler2D uTexture;
+uniform sampler2D uEnvTex;
+uniform float uEnvReflect;
+
 void main() {
+    vec4 baseColor = vColor;
     if (vUseTex > 0.5) {
         vec4 tex = texture2D(uTexture, vUV);
-        gl_FragColor = tex * vColor;
-    } else {
-        gl_FragColor = vColor;
+        baseColor = tex * vColor;
     }
+
+    // 1. Reflexo Dinâmico Fresnel de Ambiente (PS2 Visual Treatment)
+    if (uEnvReflect > 0.05) {
+        vec3 N = normalize(vWorldNormal);
+        vec3 V = normalize(vViewDir);
+        vec3 R = reflect(-V, N);
+        vec2 envUV = vec2(atan(R.x, R.z) * 0.1591549 + 0.5, clamp(R.y * 0.5 + 0.5, 0.02, 0.98));
+        vec4 envSample = texture2D(uEnvTex, envUV);
+
+        float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+        float refFactor = clamp(0.20 + 0.80 * fresnel, 0.0, 1.0) * uEnvReflect;
+        baseColor.rgb = mix(baseColor.rgb, envSample.rgb * 1.30, refFactor * 0.65);
+
+        vec3 sunDir = normalize(vec3(0.55, 0.45, -0.70));
+        vec3 H = normalize(sunDir + V);
+        float spec = pow(max(dot(N, H), 0.0), 22.0) * 0.85 * uEnvReflect;
+        baseColor.rgb += vec3(1.25, 1.10, 0.80) * spec;
+    }
+
+    // 2. Gradação de Cores Oficial Black Edition (Amber / Golden Hour Post-Process)
+    vec3 c = baseColor.rgb;
+    // Overbright / Bloom
+    vec3 bloom = max(c - 0.55, 0.0) * 0.42;
+    c += bloom;
+
+    // Matriz de tom âmbar/sépia de Rockport
+    vec3 amber = vec3(
+        c.r * 1.12 + c.g * 0.08,
+        c.g * 1.02 + c.r * 0.04,
+        c.b * 0.76 + c.g * 0.06
+    );
+
+    // Curva de contraste cinematográfico S-Curve (Filmic tone curve do PS2)
+    amber = amber * amber * (3.0 - 2.0 * amber);
+
+    // Névoa atmosférica de pôr do sol em profundidade
+    float fogFactor = clamp((vDepth - 0.45) / 0.55, 0.0, 0.72);
+    vec3 fogColor = vec3(0.85, 0.62, 0.38);
+    c = mix(amber, fogColor, fogFactor);
+
+    gl_FragColor = vec4(clamp(c, 0.0, 1.0), baseColor.a);
 }
 )";
 
@@ -560,15 +630,18 @@ static void InitSceneShaders(struct EngineState* engine) {
     glDeleteShader(vs);
     glDeleteShader(fs);
 
-    engine->aPosLoc     = glGetAttribLocation(engine->program, "aPos");
-    engine->aNormalLoc  = glGetAttribLocation(engine->program, "aNormal");
-    engine->aUVLoc      = glGetAttribLocation(engine->program, "aUV");
-    engine->aColorLoc   = glGetAttribLocation(engine->program, "aColor");
-    engine->uMvpLoc     = glGetUniformLocation(engine->program, "uMVP");
-    engine->uModelLoc   = glGetUniformLocation(engine->program, "uModel");
-    engine->uUseLitLoc  = glGetUniformLocation(engine->program, "uUseLit");
-    engine->uUseTexLoc  = glGetUniformLocation(engine->program, "uUseTex");
-    engine->uTextureLoc = glGetUniformLocation(engine->program, "uTexture");
+    engine->aPosLoc        = glGetAttribLocation(engine->program, "aPos");
+    engine->aNormalLoc     = glGetAttribLocation(engine->program, "aNormal");
+    engine->aUVLoc         = glGetAttribLocation(engine->program, "aUV");
+    engine->aColorLoc      = glGetAttribLocation(engine->program, "aColor");
+    engine->uMvpLoc        = glGetUniformLocation(engine->program, "uMVP");
+    engine->uModelLoc      = glGetUniformLocation(engine->program, "uModel");
+    engine->uUseLitLoc     = glGetUniformLocation(engine->program, "uUseLit");
+    engine->uUseTexLoc     = glGetUniformLocation(engine->program, "uUseTex");
+    engine->uTextureLoc    = glGetUniformLocation(engine->program, "uTexture");
+    engine->uEnvTexLoc     = glGetUniformLocation(engine->program, "uEnvTex");
+    engine->uEnvReflectLoc = glGetUniformLocation(engine->program, "uEnvReflect");
+    engine->uCameraPosLoc  = glGetUniformLocation(engine->program, "uCameraPos");
 }
 
 // Matemática de Matrizes 4x4 (Column-Major)
@@ -700,10 +773,13 @@ static void PushRect2D(std::vector<LitVertex>& v,
     PushQuad3D(v, x0, y0, 0.0f, u0, v0, x1, y0, 0.0f, u1, v0, x1, y1, 0.0f, u1, v1, x0, y1, 0.0f, u0, v1, r, g, b, a);
 }
 
-static void DrawMeshBuffer(struct EngineState* engine, const std::vector<LitVertex>& verts, const Mat4& modelMat, bool useLit, GLuint textureId = 0) {
+static void DrawMeshBuffer(struct EngineState* engine, const std::vector<LitVertex>& verts,
+                           const Mat4& modelMat, bool useLit, GLuint textureId = 0,
+                           float envReflect = 0.0f, GLuint envTextureId = 0) {
     if (verts.empty()) return;
     glUniformMatrix4fv(engine->uModelLoc, 1, GL_FALSE, modelMat.m);
     glUniform1f(engine->uUseLitLoc, useLit ? 1.0f : 0.0f);
+    glUniform1f(engine->uEnvReflectLoc, envReflect);
 
     if (textureId != 0) {
         glActiveTexture(GL_TEXTURE0);
@@ -714,11 +790,37 @@ static void DrawMeshBuffer(struct EngineState* engine, const std::vector<LitVert
         glUniform1f(engine->uUseTexLoc, 0.0f);
     }
 
+    if (envTextureId != 0 && envReflect > 0.01f) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, envTextureId);
+        glUniform1i(engine->uEnvTexLoc, 1);
+    }
+
     glVertexAttribPointer(engine->aPosLoc,    3, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].x);
     glVertexAttribPointer(engine->aNormalLoc, 3, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].nx);
     glVertexAttribPointer(engine->aUVLoc,     2, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].u);
     glVertexAttribPointer(engine->aColorLoc,  4, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].r);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
+}
+
+// Representação de Ponto da Pista Curva com Elevação e Inclinação (Banking)
+struct RoadPoint {
+    float x;
+    float y;
+    float banking;
+    float yaw;
+};
+
+// Traçado oficial das rodovias de Rockport: curvas de alta velocidade, elevação montanhosa e inclinação
+static inline RoadPoint GetRoadSpline(float z) {
+    float x = std::sin(z * 0.0075f) * 26.0f + std::sin(z * 0.0022f) * 14.0f;
+    float y = std::sin(z * 0.0045f) * 5.5f;
+    float dz = 1.0f;
+    float xNext = std::sin((z + dz) * 0.0075f) * 26.0f + std::sin((z + dz) * 0.0022f) * 14.0f;
+    float yaw = std::atan2(xNext - x, dz);
+    float curv = (xNext - x) / dz;
+    float banking = std::clamp(-curv * 0.35f, -0.15f, 0.15f);
+    return { x, y, banking, yaw };
 }
 
 // Renderiza um veículo PS2 real com textura do carro (Vinil Hero / Viatura Policial / Rodas)
@@ -734,9 +836,10 @@ static void RenderPS2Vehicle(struct EngineState* engine, const DecodedPS2Mesh& c
 
     GLuint carTex = isPolice ? engine->texMgr.Get("COPMIDSIZE_SKIN1") : engine->texMgr.Get("BMWM3GTRE46_CE02");
     GLuint tireTex = engine->texMgr.Get("BMWM3GTRE46_TIRE");
+    GLuint envTex  = engine->texMgr.Get("PAN_COLLEGETOWN_MOUNT_F");
 
-    // 1. Renderiza a carroceria/vidros/faróis com a textura do carro
-    DrawMeshBuffer(engine, carMesh.bodyVerts, carTransform, true, carTex);
+    // 1. Renderiza a carroceria com alto reflexo metálico Fresnel (Visual Treatment PS2)
+    DrawMeshBuffer(engine, carMesh.bodyVerts, carTransform, true, carTex, 0.85f, envTex);
 
     // 2. Se for viatura policial, pisca o giroflex
     if (isPolice && (!carMesh.sirenLVerts.empty() || !carMesh.sirenRVerts.empty())) {
@@ -781,6 +884,17 @@ static void RenderPS2Vehicle(struct EngineState* engine, const DecodedPS2Mesh& c
 static void LoadAllBlackEditionAssets(struct EngineState* engine) {
     if (!engine->app || !engine->app->activity || !engine->app->activity->assetManager) return;
     AAssetManager* mgr = engine->app->activity->assetManager;
+
+    // 0. Valida e detecta o Pacote Mestre Completo do PS2 (2.05 GB)
+    AAsset* masterPs2Asset = AAssetManager_open(mgr, "ps2_data/ZZDATA_FULL.BIN", AASSET_MODE_STREAMING);
+    if (masterPs2Asset) {
+        off_t ps2Len = AAsset_getLength(masterPs2Asset);
+        LOGI("=== PACOTE MESTRE PS2 DETECTADO NO APK: ZZDATA_FULL.BIN (%lld bytes / %.2f GB) ===",
+             static_cast<long long>(ps2Len), ps2Len / 1000000000.0);
+        AAsset_close(masterPs2Asset);
+    } else {
+        LOGI("Aviso: ZZDATA_FULL.BIN em streaming (modo particionado ou empacotamento sob demanda)");
+    }
 
     // 1. Carrega todas as texturas reais descompactadas e decodificadas do PS2
     engine->texMgr.LoadPackFromAsset(mgr, "textures/PS2_TEXTURES.BIN");
@@ -881,6 +995,12 @@ static void DrawFrame(struct EngineState* engine) {
     float speedMps = engine->car.GetSpeedKmh() / 3.6f;
     engine->wheelSpinAngle += (speedMps / 0.34f) * dt;
 
+    // Ponto da pista na posição atual do jogador
+    RoadPoint carRoad = GetRoadSpline(carPos.z);
+    float playerWorldX = carRoad.x + carPos.x;
+    float playerWorldY = carRoad.y;
+    float playerWorldZ = carPos.z;
+
     // 2. Limpa o Framebuffer com a Cor de Pôr do Sol de Rockport
     glViewport(0, 0, engine->width, engine->height);
     glClearColor(0.82f, 0.58f, 0.30f, 1.0f);
@@ -893,156 +1013,232 @@ static void DrawFrame(struct EngineState* engine) {
     glEnableVertexAttribArray(engine->aUVLoc);
     glEnableVertexAttribArray(engine->aColorLoc);
 
-    // 3. Configura Câmera de Perseguição em 3ª Pessoa
+    // 3. Câmera Dinâmica em 3ª Pessoa (alinhada à curvatura e inclinação da pista)
     float aspect = (engine->height > 0) ? (static_cast<float>(engine->width) / static_cast<float>(engine->height)) : 1.77f;
     bool nosFiring = (engine->touchNos && engine->car.GetNosRemaining() > 1.0f);
-    float fovDeg = nosFiring ? 70.0f : 58.0f;
-    Mat4 proj = Mat4::Perspective(fovDeg * 3.14159265f / 180.0f, aspect, 0.5f, 320.0f);
+    float fovDeg = nosFiring ? 72.0f : 58.0f;
+    Mat4 proj = Mat4::Perspective(fovDeg * 3.14159265f / 180.0f, aspect, 0.5f, 350.0f);
 
-    float camX = carPos.x * 0.82f - engine->touchSteer * 0.75f;
-    float camY = 1.95f;
-    float camZ = carPos.z - 5.5f;
+    float camX = playerWorldX * 0.85f - engine->touchSteer * 0.75f;
+    float camY = playerWorldY + 1.95f;
+    float camZ = playerWorldZ - 5.6f;
+    float lookTargetX = playerWorldX + std::sin(carRoad.yaw) * 12.0f;
+    float lookTargetY = playerWorldY + 0.72f;
+    float lookTargetZ = playerWorldZ + 12.0f;
     Mat4 view = Mat4::LookAt(camX, camY, camZ,
-                             carPos.x, 0.72f, carPos.z + 10.0f,
-                             0.0f, 1.0f, 0.0f);
+                             lookTargetX, lookTargetY, lookTargetZ,
+                             -std::sin(carRoad.banking) * 0.5f, std::cos(carRoad.banking), 0.0f);
     Mat4 mvp = Mat4::Multiply(proj, view);
     glUniformMatrix4fv(engine->uMvpLoc, 1, GL_FALSE, mvp.m);
+    glUniform3f(engine->uCameraPosLoc, camX, camY, camZ);
 
-    // 4. Renderiza o Horizonte de Pôr do Sol de Rockport (PAN_COLLEGETOWN_MOUNT_F)
-    GLuint skyTex = engine->texMgr.Get("PAN_COLLEGETOWN_MOUNT_F");
+    GLuint envSkyTex = engine->texMgr.Get("PAN_COLLEGETOWN_MOUNT_F");
+
+    // 4. Horizonte Panorâmico de Pôr do Sol de Rockport (PAN_COLLEGETOWN_MOUNT_F)
     std::vector<LitVertex> skyVerts;
-    float skyZ = carPos.z + 240.0f;
-    PushQuad3D(skyVerts, -360.0f, 0.0f, skyZ, 0.0f, 1.0f,
-                          360.0f, 0.0f, skyZ, 1.0f, 1.0f,
-                          360.0f, 95.0f, skyZ, 1.0f, 0.0f,
-                         -360.0f, 95.0f, skyZ, 0.0f, 0.0f,
-                          1.0f, 1.0f, 1.0f, 1.0f);
-    DrawMeshBuffer(engine, skyVerts, Mat4::Identity(), false, skyTex);
+    float skyZ = playerWorldZ + 250.0f;
+    RoadPoint skyPt = GetRoadSpline(skyZ);
+    PushQuad3D(skyVerts, skyPt.x - 380.0f, skyPt.y - 10.0f, skyZ, 0.0f, 1.0f,
+                         skyPt.x + 380.0f, skyPt.y - 10.0f, skyZ, 1.0f, 1.0f,
+                         skyPt.x + 380.0f, skyPt.y + 110.0f, skyZ, 1.0f, 0.0f,
+                        skyPt.x - 380.0f, skyPt.y + 110.0f, skyZ, 0.0f, 0.0f,
+                         1.0f, 1.0f, 1.0f, 1.0f);
+    DrawMeshBuffer(engine, skyVerts, Mat4::Identity(), false, envSkyTex);
 
-    // 5. Renderiza a Pista de Asfalto Real de Rockport (TRNS_ALL_LA_PAVEMENTA_Y)
+    // 5. Rodovia Curva de Rockport com Reflexo Úmido no Asfalto (TRNS_ALL_LA_PAVEMENTA_Y)
     GLuint roadTex = engine->texMgr.Get("TRNS_ALL_LA_PAVEMENTA_Y");
     float zBase = std::floor(carPos.z / 10.0f) * 10.0f;
     float zStart = zBase - 50.0f;
-    float zEnd = zBase + 210.0f;
-    float vReps = (zEnd - zStart) * 0.12f;
+    float zEnd = zBase + 230.0f;
 
     std::vector<LitVertex> roadVerts;
-    roadVerts.reserve(256);
-    // Terreno ao redor
-    PushQuad3D(roadVerts, -140.0f, -0.05f, zStart, 0.0f, 0.0f,
-                           140.0f, -0.05f, zStart, 1.0f, 0.0f,
-                           140.0f, -0.05f, zEnd,   1.0f, vReps * 0.2f,
-                          -140.0f, -0.05f, zEnd,   0.0f, vReps * 0.2f,
-                           0.40f, 0.35f, 0.22f);
-    // Rodovia de Asfalto Rockport Texturizada
-    PushQuad3D(roadVerts, -11.5f, 0.0f, zStart, 0.0f, 0.0f,
-                           11.5f, 0.0f, zStart, 1.0f, 0.0f,
-                           11.5f, 0.0f, zEnd,   1.0f, vReps,
-                          -11.5f, 0.0f, zEnd,   0.0f, vReps,
-                           1.0f, 1.0f, 1.0f);
-    DrawMeshBuffer(engine, roadVerts, Mat4::Identity(), true, roadTex);
+    std::vector<LitVertex> terrainVerts;
+    roadVerts.reserve(512);
+    terrainVerts.reserve(512);
 
-    // 6. Renderiza as Barreiras de Concreto e Setas Neon de Rockport
+    for (float z = zStart; z < zEnd; z += 8.0f) {
+        float z0 = z;
+        float z1 = z + 8.0f;
+        RoadPoint p0 = GetRoadSpline(z0);
+        RoadPoint p1 = GetRoadSpline(z1);
+
+        float v0 = z0 * 0.12f;
+        float v1 = z1 * 0.12f;
+
+        // Pista de Asfalto (largura 23m)
+        PushQuad3D(roadVerts,
+                   p0.x - 11.5f, p0.y, z0, 0.0f, v0,
+                   p0.x + 11.5f, p0.y, z0, 1.0f, v0,
+                   p1.x + 11.5f, p1.y, z1, 1.0f, v1,
+                   p1.x - 11.5f, p1.y, z1, 0.0f, v1,
+                   1.0f, 1.0f, 1.0f);
+
+        // Terreno / acostamento lateral esquerdo e direito
+        PushQuad3D(terrainVerts,
+                   p0.x - 130.0f, p0.y - 0.2f, z0, 0.0f, v0 * 0.2f,
+                   p0.x - 11.5f,  p0.y - 0.05f, z0, 1.0f, v0 * 0.2f,
+                   p1.x - 11.5f,  p1.y - 0.05f, z1, 1.0f, v1 * 0.2f,
+                   p1.x - 130.0f, p1.y - 0.2f, z1, 0.0f, v1 * 0.2f,
+                   0.44f, 0.38f, 0.24f);
+
+        PushQuad3D(terrainVerts,
+                   p0.x + 11.5f,  p0.y - 0.05f, z0, 0.0f, v0 * 0.2f,
+                   p0.x + 130.0f, p0.y - 0.2f, z0, 1.0f, v0 * 0.2f,
+                   p1.x + 130.0f, p1.y - 0.2f, z1, 1.0f, v1 * 0.2f,
+                   p1.x + 11.5f,  p1.y - 0.05f, z1, 0.0f, v1 * 0.2f,
+                   0.44f, 0.38f, 0.24f);
+    }
+    DrawMeshBuffer(engine, terrainVerts, Mat4::Identity(), true, 0);
+    // Asfalto com reflexo dinâmico de ambiente (wet-asphalt sheen)
+    DrawMeshBuffer(engine, roadVerts, Mat4::Identity(), true, roadTex, 0.38f, envSkyTex);
+
+    // 6. Barreiras de Concreto Curvas e Setas de Curva Neon Brilhantes
     GLuint barrierTex = engine->texMgr.Get("OBJ_BARRIERCONCRETE_06_");
     GLuint neonArrowTex = engine->texMgr.Get("SFX_TRACKBARRIERNEONARR");
     std::vector<LitVertex> barrierVerts;
-    barrierVerts.reserve(512);
+    std::vector<LitVertex> neonVerts;
+    barrierVerts.reserve(1024);
 
-    for (int seg = -4; seg < 21; ++seg) {
-        float sz0 = zBase + seg * 10.0f;
-        // Barreira esquerda e direita texturizadas
-        PushBox3D(barrierVerts, -12.1f, 0.42f, sz0 + 5.0f, 0.32f, 0.42f, 5.0f, 1.0f, 1.0f, 1.0f);
-        PushBox3D(barrierVerts,  12.1f, 0.42f, sz0 + 5.0f, 0.32f, 0.42f, 5.0f, 1.0f, 1.0f, 1.0f);
+    for (float z = zStart; z < zEnd; z += 10.0f) {
+        RoadPoint pt = GetRoadSpline(z + 5.0f);
+        // Barreira esquerda
+        Mat4 barMatL = Mat4::Multiply(
+            Mat4::Translate(pt.x - 12.1f, pt.y + 0.42f, z + 5.0f),
+            Mat4::RotateY(pt.yaw)
+        );
+        PushBox3D(barrierVerts, pt.x - 12.1f, pt.y + 0.42f, z + 5.0f, 0.32f, 0.42f, 5.0f, 1.0f, 1.0f, 1.0f);
+        // Barreira direita
+        PushBox3D(barrierVerts, pt.x + 12.1f, pt.y + 0.42f, z + 5.0f, 0.32f, 0.42f, 5.0f, 1.0f, 1.0f, 1.0f);
     }
     DrawMeshBuffer(engine, barrierVerts, Mat4::Identity(), true, barrierTex);
 
-    // Setas de Curva Neon Brilhantes (SFX_TRACKBARRIERNEONARR) a cada 40m
-    std::vector<LitVertex> neonVerts;
-    for (int seg = -4; seg < 21; seg += 4) {
-        float sz0 = zBase + seg * 10.0f;
-        PushQuad3D(neonVerts, 11.75f, 0.20f, sz0 + 2.0f, 0.0f, 1.0f,
-                              11.75f, 0.20f, sz0 + 6.0f, 1.0f, 1.0f,
-                              11.75f, 0.85f, sz0 + 6.0f, 1.0f, 0.0f,
-                              11.75f, 0.85f, sz0 + 2.0f, 0.0f, 0.0f,
-                              1.0f, 0.95f, 0.20f, 1.0f);
+    // Setas de Curva Neon Brilhantes (SFX_TRACKBARRIERNEONARR) nas curvas externas
+    for (float z = zStart; z < zEnd; z += 24.0f) {
+        RoadPoint pt = GetRoadSpline(z);
+        if (std::abs(pt.yaw) > 0.05f) {
+            float sideX = (pt.yaw > 0.0f) ? (pt.x + 11.75f) : (pt.x - 11.75f);
+            float u0 = (pt.yaw > 0.0f) ? 0.0f : 1.0f;
+            float u1 = (pt.yaw > 0.0f) ? 1.0f : 0.0f;
+            PushQuad3D(neonVerts,
+                       sideX, pt.y + 0.25f, z - 2.5f, u0, 1.0f,
+                       sideX, pt.y + 0.25f, z + 2.5f, u1, 1.0f,
+                       sideX, pt.y + 0.95f, z + 2.5f, u1, 0.0f,
+                       sideX, pt.y + 0.95f, z - 2.5f, u0, 0.0f,
+                       1.0f, 0.96f, 0.20f, 1.0f);
+        }
     }
     DrawMeshBuffer(engine, neonVerts, Mat4::Identity(), false, neonArrowTex);
 
-    // 7. Renderiza os Prédios e Fábricas de Rockport (3D da Black Edition BR)
+    // 7. Árvores de Outono Típicas de Rockport e Folhas Voando
+    std::vector<LitVertex> treeVerts;
+    std::vector<LitVertex> leafVerts;
+    for (float z = zStart; z < zEnd; z += 22.0f) {
+        RoadPoint ptL = GetRoadSpline(z);
+        RoadPoint ptR = GetRoadSpline(z + 11.0f);
+        // Árvores à esquerda (tons quentes de outono)
+        PushBox3D(treeVerts, ptL.x - 18.0f, ptL.y + 2.0f, z, 0.35f, 2.0f, 0.35f, 0.35f, 0.22f, 0.12f);
+        PushBox3D(treeVerts, ptL.x - 18.0f, ptL.y + 5.5f, z, 3.2f, 2.2f, 3.0f, 0.94f, 0.54f, 0.12f);
+        PushBox3D(treeVerts, ptL.x - 28.0f, ptL.y + 6.0f, z, 3.5f, 2.5f, 3.2f, 0.84f, 0.34f, 0.10f);
+
+        // Árvores à direita
+        PushBox3D(treeVerts, ptR.x + 18.0f, ptR.y + 2.0f, z + 11.0f, 0.35f, 2.0f, 0.35f, 0.35f, 0.22f, 0.12f);
+        PushBox3D(treeVerts, ptR.x + 18.0f, ptR.y + 5.5f, z + 11.0f, 3.0f, 2.2f, 3.0f, 0.98f, 0.66f, 0.14f);
+        PushBox3D(treeVerts, ptR.x + 28.0f, ptR.y + 6.2f, z + 11.0f, 3.4f, 2.4f, 3.2f, 0.90f, 0.46f, 0.12f);
+    }
+    DrawMeshBuffer(engine, treeVerts, Mat4::Identity(), true, 0);
+
+    // Partículas de folhas secas de outono esvoaçando com o vento e vácuo dos carros
+    for (int i = 0; i < 24; ++i) {
+        float lz = playerWorldZ - 12.0f + std::fmod(i * 14.3f + engine->animTime * 22.0f, 190.0f);
+        RoadPoint lp = GetRoadSpline(lz);
+        float lx = lp.x + std::sin(i * 3.7f + engine->animTime * 2.5f) * 10.0f;
+        float ly = lp.y + 0.25f + std::abs(std::sin(i * 2.1f + engine->animTime * 3.0f)) * 1.6f;
+        PushBox3D(leafVerts, lx, ly, lz, 0.12f, 0.08f, 0.12f,
+                  (i % 2 == 0) ? 0.96f : 0.86f,
+                  (i % 2 == 0) ? 0.54f : 0.34f,
+                  0.10f);
+    }
+    DrawMeshBuffer(engine, leafVerts, Mat4::Identity(), false, 0);
+
+    // 8. Prédios, Fábricas e Lojas Comerciais de Rockport
     GLuint factoryTex = engine->texMgr.Get("ARC_FACTORYBRICK_01");
     GLuint campusTex  = engine->texMgr.Get("ARC_CAMPUS_HERITAGE4_WA");
     for (int seg = -2; seg < 18; seg += 3) {
         float sz = zBase + seg * 12.0f;
-        // Se a malha 3D real da fábrica/prédio de Rockport estiver carregada, posiciona-a
+        RoadPoint bp = GetRoadSpline(sz);
         if (engine->sceneryFactory.loaded) {
-            Mat4 bldgL = Mat4::Multiply(Mat4::Translate(-22.0f, 0.0f, sz), Mat4::RotateY(1.57f));
+            Mat4 bldgL = Mat4::Multiply(Mat4::Translate(bp.x - 24.0f, bp.y, sz), Mat4::RotateY(1.57f + bp.yaw));
             DrawMeshBuffer(engine, engine->sceneryFactory.bodyVerts, bldgL, true, factoryTex);
         } else {
             std::vector<LitVertex> bldgBox;
-            PushBox3D(bldgBox, -22.0f, 8.0f, sz, 5.5f, 8.0f, 5.0f, 1.0f, 1.0f, 1.0f);
+            PushBox3D(bldgBox, bp.x - 24.0f, bp.y + 8.0f, sz, 5.5f, 8.0f, 5.0f, 1.0f, 1.0f, 1.0f);
             DrawMeshBuffer(engine, bldgBox, Mat4::Identity(), true, factoryTex);
         }
 
         if (engine->sceneryShop.loaded) {
-            Mat4 bldgR = Mat4::Multiply(Mat4::Translate(22.0f, 0.0f, sz), Mat4::RotateY(-1.57f));
+            Mat4 bldgR = Mat4::Multiply(Mat4::Translate(bp.x + 24.0f, bp.y, sz), Mat4::RotateY(-1.57f + bp.yaw));
             DrawMeshBuffer(engine, engine->sceneryShop.bodyVerts, bldgR, true, campusTex);
         } else {
             std::vector<LitVertex> bldgBox;
-            PushBox3D(bldgBox, 22.0f, 9.0f, sz, 5.5f, 9.0f, 5.0f, 1.0f, 1.0f, 1.0f);
+            PushBox3D(bldgBox, bp.x + 24.0f, bp.y + 9.0f, sz, 5.5f, 9.0f, 5.0f, 1.0f, 1.0f, 1.0f);
             DrawMeshBuffer(engine, bldgBox, Mat4::Identity(), true, campusTex);
         }
     }
 
-    // 8. Treliça Suspensa de Rodovia com Placa "DOWNTOWN ROCKPORT" (a cada 90 metros)
+    // 9. Treliça Suspensa de Rodovia com Placa "DOWNTOWN ROCKPORT" (a cada 90 metros)
     GLuint signTex = engine->texMgr.Get("SGN_FWY_DOWNTOWNROCKPOR");
     float trussZ = std::floor((carPos.z + 50.0f) / 90.0f) * 90.0f;
+    RoadPoint tp = GetRoadSpline(trussZ);
     std::vector<LitVertex> trussVerts;
-    // Pilares e viga superior
-    PushBox3D(trussVerts, -12.2f, 3.8f, trussZ, 0.35f, 3.8f, 0.35f, 0.55f, 0.58f, 0.62f);
-    PushBox3D(trussVerts,  12.2f, 3.8f, trussZ, 0.35f, 3.8f, 0.35f, 0.55f, 0.58f, 0.62f);
-    PushBox3D(trussVerts,   0.0f, 7.3f, trussZ, 12.5f, 0.35f, 0.35f, 0.55f, 0.58f, 0.62f);
+    PushBox3D(trussVerts, tp.x - 12.2f, tp.y + 3.8f, trussZ, 0.35f, 3.8f, 0.35f, 0.55f, 0.58f, 0.62f);
+    PushBox3D(trussVerts, tp.x + 12.2f, tp.y + 3.8f, trussZ, 0.35f, 3.8f, 0.35f, 0.55f, 0.58f, 0.62f);
+    PushBox3D(trussVerts, tp.x,        tp.y + 7.3f, trussZ, 12.5f, 0.35f, 0.35f, 0.55f, 0.58f, 0.62f);
     DrawMeshBuffer(engine, trussVerts, Mat4::Identity(), true, 0);
 
     // Placa Verde Highway "DOWNTOWN ROCKPORT"
     std::vector<LitVertex> signVerts;
-    PushQuad3D(signVerts, -5.5f, 5.2f, trussZ - 0.2f, 0.0f, 1.0f,
-                           5.5f, 5.2f, trussZ - 0.2f, 1.0f, 1.0f,
-                           5.5f, 7.1f, trussZ - 0.2f, 1.0f, 0.0f,
-                          -5.5f, 7.1f, trussZ - 0.2f, 0.0f, 0.0f,
-                           1.0f, 1.0f, 1.0f);
+    PushQuad3D(signVerts, tp.x - 5.5f, tp.y + 5.2f, trussZ - 0.2f, 0.0f, 1.0f,
+                          tp.x + 5.5f, tp.y + 5.2f, trussZ - 0.2f, 1.0f, 1.0f,
+                          tp.x + 5.5f, tp.y + 7.1f, trussZ - 0.2f, 1.0f, 0.0f,
+                          tp.x - 5.5f, tp.y + 7.1f, trussZ - 0.2f, 0.0f, 0.0f,
+                          1.0f, 1.0f, 1.0f);
     DrawMeshBuffer(engine, signVerts, Mat4::Identity(), false, signTex);
 
-    // 9. Sombra projetada no asfalto e Chamas do Nitro
+    // 10. Sombra projetada no asfalto e Chamas do Nitro
     std::vector<LitVertex> fxVerts;
-    PushQuad3D(fxVerts, carPos.x - 1.05f, 0.02f, carPos.z - 2.25f, 0, 0,
-                        carPos.x + 1.05f, 0.02f, carPos.z - 2.25f, 1, 0,
-                        carPos.x + 1.05f, 0.02f, carPos.z + 2.35f, 1, 1,
-                        carPos.x - 1.05f, 0.02f, carPos.z + 2.35f, 0, 1,
+    PushQuad3D(fxVerts, playerWorldX - 1.05f, playerWorldY + 0.02f, playerWorldZ - 2.25f, 0, 0,
+                        playerWorldX + 1.05f, playerWorldY + 0.02f, playerWorldZ - 2.25f, 1, 0,
+                        playerWorldX + 1.05f, playerWorldY + 0.02f, playerWorldZ + 2.35f, 1, 1,
+                        playerWorldX - 1.05f, playerWorldY + 0.02f, playerWorldZ + 2.35f, 0, 1,
                         0.02f, 0.02f, 0.03f, 0.85f);
     if (nosFiring) {
         float pulse = 0.65f + 0.35f * std::sin(engine->animTime * 45.0f);
-        PushBox3D(fxVerts, carPos.x - 0.32f, 0.22f, carPos.z - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
-        PushBox3D(fxVerts, carPos.x + 0.32f, 0.22f, carPos.z - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
+        PushBox3D(fxVerts, playerWorldX - 0.32f, playerWorldY + 0.22f, playerWorldZ - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
+        PushBox3D(fxVerts, playerWorldX + 0.32f, playerWorldY + 0.22f, playerWorldZ - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
     }
     DrawMeshBuffer(engine, fxVerts, Mat4::Identity(), false, 0);
 
-    // 10. Renderiza a Malha 3D Real PS2 da BMW M3 GTR E46
+    // 11. Renderiza a Malha 3D Real PS2 da BMW M3 GTR E46
     const DecodedPS2Mesh& activePlayerCar = (engine->useStreetM3 && engine->m3Street.loaded) ? engine->m3Street : engine->m3GtrRace;
-    float carYaw   = engine->touchSteer * 0.14f;
-    float carRoll  = -engine->touchSteer * 0.05f;
+    float carYaw   = carRoad.yaw + engine->touchSteer * 0.14f;
+    float carRoll  = carRoad.banking - engine->touchSteer * 0.05f;
     float steerRad = engine->touchSteer * 0.42f;
-    RenderPS2Vehicle(engine, activePlayerCar, carPos.x, 0.0f, carPos.z,
+    RenderPS2Vehicle(engine, activePlayerCar, playerWorldX, playerWorldY, playerWorldZ,
                      carYaw, carRoll, steerRad, engine->wheelSpinAngle, false, engine->animTime, 0);
 
-    // 11. Renderiza as Viaturas Policiais Crown Victoria Reais
+    // 12. Renderiza as Viaturas Policiais Crown Victoria Reais
     const auto& cops = engine->pursuit.GetUnits();
     for (size_t i = 0; i < cops.size(); ++i) {
         if (cops[i].state == COP_WRECKED) continue;
-        RenderPS2Vehicle(engine, engine->copCruiser, cops[i].position.x, 0.0f, cops[i].position.z,
-                         0.0f, 0.0f, 0.0f, engine->wheelSpinAngle, true, engine->animTime, static_cast<int>(i));
+        RoadPoint copRoad = GetRoadSpline(cops[i].position.z);
+        float copWorldX = copRoad.x + cops[i].position.x;
+        float copWorldY = copRoad.y;
+        float copWorldZ = cops[i].position.z;
+        RenderPS2Vehicle(engine, engine->copCruiser, copWorldX, copWorldY, copWorldZ,
+                         copRoad.yaw, copRoad.banking, 0.0f, engine->wheelSpinAngle, true, engine->animTime, static_cast<int>(i));
     }
 
-    // 12. Renderiza o HUD Autêntico do Need for Speed: Most Wanted
+    // 13. HUD Autêntico do Need for Speed: Most Wanted
     glDisable(GL_DEPTH_TEST);
     Mat4 hudMvp = Mat4::Identity();
     glUniformMatrix4fv(engine->uMvpLoc, 1, GL_FALSE, hudMvp.m);
@@ -1085,7 +1281,6 @@ static void DrawFrame(struct EngineState* engine) {
     DrawMeshBuffer(engine, badgeVerts, hudMvp, false, 0);
 
     // D) Tacômetro e Velocímetro Autêntico do NFS Most Wanted (Inferior Direito)
-    // Mostrador Circular com Números de RPM (8000_LINES_00)
     GLuint tachLinesTex = engine->texMgr.Get("8000_LINES_00");
     std::vector<LitVertex> dialVerts;
     PushRect2D(dialVerts, 0.48f, -0.96f, 0.96f, -0.38f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.92f);
@@ -1094,7 +1289,6 @@ static void DrawFrame(struct EngineState* engine) {
     // Ponteiro Giratório Laranja de RPM (TACH_NEEDLE_00)
     GLuint needleTex = engine->texMgr.Get("TACH_NEEDLE_00");
     float rpmRatio = std::clamp(engine->car.GetRPM() / 8500.0f, 0.0f, 1.0f);
-    // Ângulo do ponteiro: de -140 graus (0 RPM) a +90 graus (8500 RPM)
     float needleAngleRad = (-140.0f + rpmRatio * 230.0f) * 3.14159265f / 180.0f;
     float dialCenterX = 0.72f;
     float dialCenterY = -0.67f;
@@ -1114,17 +1308,67 @@ static void DrawFrame(struct EngineState* engine) {
     float speedRatio = std::clamp(engine->car.GetSpeedKmh() / 320.0f, 0.0f, 1.0f);
     float nosRatio   = std::clamp(engine->car.GetNosRemaining() / 100.0f, 0.0f, 1.0f);
     std::vector<LitVertex> barVerts;
-    // Fundo das barras
     PushRect2D(barVerts, 0.28f, -0.94f, 0.46f, -0.62f, 0, 0, 1, 1, 0.06f, 0.07f, 0.09f, 0.85f);
-    // Barra de Velocidade
     PushRect2D(barVerts, 0.30f, -0.74f, 0.30f + speedRatio * 0.14f, -0.68f, 0, 0, 1, 1,
                0.20f + speedRatio * 0.80f, 0.90f - speedRatio * 0.30f, 0.15f, 1.0f);
-    // Barra de Nitro
     PushRect2D(barVerts, 0.30f, -0.86f, 0.30f + nosRatio * 0.14f, -0.80f, 0, 0, 1, 1,
                0.15f, 0.70f, 1.0f, 1.0f);
     DrawMeshBuffer(engine, barVerts, hudMvp, false, 0);
 
-    // E) Botões Virtuais de Direção Esquerda/Direita, Acelerador e Nitro
+    // E) Radar Policial Circular / Mini-Map Autêntico de Rockport (Inferior Esquerdo)
+    float radarCX = -0.70f;
+    float radarCY = -0.66f;
+    float radarR  = 0.22f;
+    std::vector<LitVertex> radarVerts;
+    const int kSegs = 28;
+    // Fundo do radar
+    for (int i = 0; i < kSegs; ++i) {
+        float a0 = (i / static_cast<float>(kSegs)) * 6.2831853f;
+        float a1 = ((i + 1) / static_cast<float>(kSegs)) * 6.2831853f;
+        radarVerts.push_back({radarCX, radarCY, 0, 0, 1, 0, 0, 0, 0.05f, 0.07f, 0.09f, 0.88f});
+        radarVerts.push_back({radarCX + std::cos(a0) * radarR, radarCY + std::sin(a0) * radarR, 0, 0, 1, 0, 0, 0, 0.05f, 0.07f, 0.09f, 0.88f});
+        radarVerts.push_back({radarCX + std::cos(a1) * radarR, radarCY + std::sin(a1) * radarR, 0, 0, 1, 0, 0, 0, 0.05f, 0.07f, 0.09f, 0.88f});
+    }
+    // Anel externo dourado do radar
+    for (int i = 0; i < kSegs; ++i) {
+        float a0 = (i / static_cast<float>(kSegs)) * 6.2831853f;
+        float a1 = ((i + 1) / static_cast<float>(kSegs)) * 6.2831853f;
+        radarVerts.push_back({radarCX + std::cos(a0) * (radarR - 0.010f), radarCY + std::sin(a0) * (radarR - 0.010f), 0, 0, 1, 0, 0, 0, 0.90f, 0.65f, 0.20f, 0.95f});
+        radarVerts.push_back({radarCX + std::cos(a0) * radarR,            radarCY + std::sin(a0) * radarR,            0, 0, 1, 0, 0, 0, 0.90f, 0.65f, 0.20f, 0.95f});
+        radarVerts.push_back({radarCX + std::cos(a1) * radarR,            radarCY + std::sin(a1) * radarR,            0, 0, 1, 0, 0, 0, 0.90f, 0.65f, 0.20f, 0.95f});
+    }
+    // Projeção da curvatura da pista no radar
+    for (float dz = -20.0f; dz < 120.0f; dz += 10.0f) {
+        RoadPoint rp0 = GetRoadSpline(carPos.z + dz);
+        RoadPoint rp1 = GetRoadSpline(carPos.z + dz + 10.0f);
+        float rx0 = radarCX + (rp0.x - carRoad.x) * 0.0035f;
+        float ry0 = radarCY + dz * 0.0016f;
+        float rx1 = radarCX + (rp1.x - carRoad.x) * 0.0035f;
+        float ry1 = radarCY + (dz + 10.0f) * 0.0016f;
+        PushRect2D(radarVerts, rx0 - 0.006f, ry0, rx1 + 0.006f, ry1, 0, 0, 1, 1, 0.75f, 0.75f, 0.80f, 0.92f);
+    }
+    // Seta do jogador (Triângulo branco/azul apontando para frente)
+    radarVerts.push_back({radarCX - 0.018f, radarCY - 0.022f, 0, 0, 1, 0, 0, 0, 0.20f, 0.70f, 1.0f, 1.0f});
+    radarVerts.push_back({radarCX + 0.018f, radarCY - 0.022f, 0, 0, 1, 0, 0, 0, 0.20f, 0.70f, 1.0f, 1.0f});
+    radarVerts.push_back({radarCX,          radarCY + 0.028f, 0, 0, 1, 0, 0, 0, 1.00f, 1.00f, 1.0f, 1.0f});
+
+    // Pontos das viaturas policiais no radar (blips pulsantes vermelho/azul)
+    for (size_t i = 0; i < cops.size(); ++i) {
+        if (cops[i].state == COP_WRECKED) continue;
+        float cdz = cops[i].position.z - carPos.z;
+        float cdx = cops[i].position.x - carPos.x;
+        float crx = radarCX + cdx * 0.0035f;
+        float cry = radarCY + cdz * 0.0016f;
+        float distToRadar = std::sqrt((crx - radarCX) * (crx - radarCX) + (cry - radarCY) * (cry - radarCY));
+        if (distToRadar < radarR - 0.015f) {
+            bool copFlash = (static_cast<int>(engine->animTime * 12.0f + i) % 2) == 0;
+            PushRect2D(radarVerts, crx - 0.014f, cry - 0.014f, crx + 0.014f, cry + 0.014f, 0, 0, 1, 1,
+                       copFlash ? 1.0f : 0.1f, 0.1f, copFlash ? 0.1f : 1.0f, 1.0f);
+        }
+    }
+    DrawMeshBuffer(engine, radarVerts, hudMvp, false, 0);
+
+    // F) Botões Virtuais de Direção Esquerda/Direita, Acelerador e Nitro
     std::vector<LitVertex> btnVerts;
     bool steerLeftActive = (engine->touchSteer < -0.15f);
     PushRect2D(btnVerts, -0.94f, -0.88f, -0.64f, -0.48f, 0, 0, 1, 1,

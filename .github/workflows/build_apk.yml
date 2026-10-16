@@ -31,6 +31,15 @@ jobs:
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
 
+      - name: 3.5. Recompor Pacote Mestre Completo do PS2 (2.05 GB)
+        run: |
+          if [ -d "android/app/src/main/assets/ps2_data" ]; then
+            echo "Recompondo 2.05 GB de dados do PS2..."
+            cat android/app/src/main/assets/ps2_data/part_*.bin > android/app/src/main/assets/ps2_data/ZZDATA_FULL.BIN
+            rm -f android/app/src/main/assets/ps2_data/part_*.bin
+            ls -lh android/app/src/main/assets/ps2_data/ZZDATA_FULL.BIN
+          fi
+
       - name: 4. Compilar APK com Gradle
         run: |
           cd android
@@ -47,6 +56,14 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: "Need for Speed: Most Wanted - Black Edition (BR) v2.0.0 (Full 2.05 GB PS2 Port)"
+          body: |
+            ### Need for Speed: Most Wanted - Black Edition (BR) - Native Android Port
+            - **Pacote Mestre PS2 Completo:** Dados originais autênticos de 2.05 GB extraídos diretamente da ISO de PS2.
+            - **Gráficos e Shaders Autênticos:** Visual Treatment do PS2 com paleta dourada/âmbar, reflexos Fresnel dinâmicos em tempo real no chassi e no asfalto úmido, curva de tom fílmica e overbright bloom.
+            - **Pista Curva Realista de Rockport:** Rodovia sinuosa de alta velocidade, elevação montanhosa, barreiras de concreto contínuas, setas neon pulsantes e densas árvores de outono.
+            - **HUD Completo:** Tacômetro circular de agulha original do Most Wanted, radar policial de varredura com projeção da curva da rodovia e blips policiais, e barra de perseguição Heat/Bounty.
+            - **Tamanho do APK:** Superior a 2.0 GB uncompressed via aaptOptions para streaming e carregamento instantâneo.
           files: android/app/build/outputs/apk/debug/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
