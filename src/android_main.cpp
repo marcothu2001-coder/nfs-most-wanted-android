@@ -26,20 +26,84 @@
 #define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
 #define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
 
-// Vértice 3D com Posição, Normal de Superfície (para iluminação metálica EAGL4) e Cor/Material
+// Vértice 3D com Posição, Normal de Superfície, Coordenadas UV de Textura e Cor/Material
 struct LitVertex {
     float x, y, z;
     float nx, ny, nz;
+    float u, v;
     float r, g, b, a;
 };
 
-// Malha decodificada diretamente dos arquivos GEOMETRY.BIN do PS2 (VU1 VIF Chunks)
-struct DecodedPS2Car {
-    std::vector<LitVertex> bodyVerts;   // Chassi, carroceria, vidros, faróis, lanternas, interior, piloto
-    std::vector<LitVertex> wheelVerts;  // Roda 3D (FRONT_TIRE_B + BRAKE_B)
-    std::vector<LitVertex> sirenLVerts; // Giroflex esquerdo (para viaturas policiais)
-    std::vector<LitVertex> sirenRVerts; // Giroflex direito (para viaturas policiais)
+// Malha decodificada diretamente dos arquivos GEOMETRY.BIN e SCENERY_L2RA.BIN do PS2 (VU1 VIF Chunks)
+struct DecodedPS2Mesh {
+    std::vector<LitVertex> bodyVerts;   // Chassi, carroceria, fachada, etc.
+    std::vector<LitVertex> wheelVerts;  // Rodas
+    std::vector<LitVertex> sirenLVerts; // Giroflex esquerdo
+    std::vector<LitVertex> sirenRVerts; // Giroflex direito
     bool loaded = false;
+};
+
+// Gerenciador de Texturas Reais do PS2 extraídas do Need for Speed: Most Wanted - Black Edition (BR)
+struct PS2TextureManager {
+    std::map<std::string, GLuint> textures;
+
+    GLuint Get(const std::string& name) const {
+        auto it = textures.find(name);
+        return (it != textures.end()) ? it->second : 0;
+    }
+
+    void LoadPackFromAsset(AAssetManager* mgr, const char* assetPath) {
+        if (!mgr) return;
+        AAsset* asset = AAssetManager_open(mgr, assetPath, AASSET_MODE_BUFFER);
+        if (!asset) {
+            LOGW("Arquivo de texturas PS2 nao encontrado: %s", assetPath);
+            return;
+        }
+        off_t len = AAsset_getLength(asset);
+        std::vector<u8> buf(static_cast<size_t>(len));
+        AAsset_read(asset, buf.data(), len);
+        AAsset_close(asset);
+
+        if (buf.size() < 12 || std::memcmp(buf.data(), "NFSWTEX1", 8) != 0) {
+            LOGW("Cabecalho de texturas invalido em: %s", assetPath);
+            return;
+        }
+
+        u32 count = 0;
+        std::memcpy(&count, buf.data() + 8, 4);
+        size_t p = 12;
+
+        for (u32 i = 0; i < count && p + 44 <= buf.size(); ++i) {
+            char nameBuf[33] = {0};
+            std::memcpy(nameBuf, buf.data() + p, 32);
+            std::string texName(nameBuf);
+            p += 32;
+
+            u32 w = 0, h = 0, dataLen = 0;
+            std::memcpy(&w, buf.data() + p, 4);
+            std::memcpy(&h, buf.data() + p + 4, 4);
+            std::memcpy(&dataLen, buf.data() + p + 8, 4);
+            p += 12;
+
+            if (p + dataLen > buf.size()) break;
+            const u8* rgbaData = buf.data() + p;
+            p += dataLen;
+
+            GLuint tex = 0;
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(w), static_cast<GLsizei>(h),
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, rgbaData);
+
+            textures[texName] = tex;
+        }
+
+        LOGI("Gerenciador de Texturas: Carregadas %zu texturas reais PS2 do ativo '%s'!", textures.size(), assetPath);
+    }
 };
 
 struct EngineState {
@@ -51,26 +115,41 @@ struct EngineState {
     int32_t height = 0;
     bool hasFocus = false;
 
-    // Shaders OpenGL ES (Iluminação Metálica EAGL4 + Specular)
+    // Shaders OpenGL ES (Iluminação EAGL4 + Texturização 2D)
     GLuint program = 0;
     GLint aPosLoc = -1;
     GLint aNormalLoc = -1;
+    GLint aUVLoc = -1;
     GLint aColorLoc = -1;
     GLint uMvpLoc = -1;
     GLint uModelLoc = -1;
     GLint uUseLitLoc = -1;
+    GLint uUseTexLoc = -1;
+    GLint uTextureLoc = -1;
 
     // Subsistemas do Jogo
     VehicleSimulation car;
     PursuitSystem pursuit;
     WorldStreamer world;
     AndroidRenderer renderer;
+    PS2TextureManager texMgr;
 
     // Modelos 3D Reais Extraídos do Need for Speed: Most Wanted - Black Edition (BR)
-    DecodedPS2Car m3GtrRace;  // CARS\BMWM3GTRE46\GEOMETRY.BIN (9.292 vértices PS2 VU1)
-    DecodedPS2Car m3Street;   // CARS\BMWM3\GEOMETRY.BIN (8.085 vértices PS2 VU1)
-    DecodedPS2Car copCruiser; // CARS\COPMIDSIZE\GEOMETRY.BIN (3.866 vértices PS2 VU1)
-    bool useStreetM3 = false; // Alterna entre BMW M3 GTR E46 (Race) e BMW M3 (Street)
+    DecodedPS2Mesh m3GtrRace;  // CARS\BMWM3GTRE46\GEOMETRY.BIN (9.292 vértices PS2 VU1)
+    DecodedPS2Mesh m3Street;   // CARS\BMWM3\GEOMETRY.BIN (8.085 vértices PS2 VU1)
+    DecodedPS2Mesh copCruiser; // CARS\COPMIDSIZE\GEOMETRY.BIN (3.866 vértices PS2 VU1)
+    
+    // Cenário 3D Real de Rockport (Record #28: eLabScenery_L2RA_TC_WestPark_Sunset.bin)
+    DecodedPS2Mesh sceneryShop;    // XB_SHOPBLOCKC_1B_00 (Lojas e prédios comerciais)
+    DecodedPS2Mesh sceneryHouse;   // XB_HOUSEE_2B_00 (Casas suburbanas)
+    DecodedPS2Mesh sceneryFactory; // XB_IF_OLDFACTORYE_1Z_LL_00 (Fábrica antiga de tijolos)
+    DecodedPS2Mesh sceneryTruss;   // XO_FWY_SIGNSUPPORTTRUSS_1B_00 (Treliça suspensa de rodovia)
+    DecodedPS2Mesh sceneryLight;   // XO_STREETLIGHTCB_1B_00 (Postes de iluminação de Rockport)
+    DecodedPS2Mesh sceneryBarrier; // XW_BARRCONCHWY8M_1B_SA_00 (Barreira de concreto real)
+    DecodedPS2Mesh sceneryTree;    // XT_CT_FALLTREED_1B_JG_00 (Árvores de outono)
+    DecodedPS2Mesh scenerySky;     // SKYDOME (Domo celeste de pôr do sol)
+
+    bool useStreetM3 = false;
     size_t zdirEntries = 0;
     size_t tpkTexturesCount = 0;
     size_t gameplayEventsCount = 0;
@@ -103,10 +182,10 @@ static std::vector<u8> ReadAssetBytes(AAssetManager* mgr, const char* assetPath)
 // ============================================================================
 // DECODIFICADOR NATIVO DE GEOMETRIA PS2 VU1 VIF (0x80134000 / 0x00134A02)
 // Converte os pacotes vetoriais do PS2 (Need for Speed Most Wanted Black Edition BR)
-// diretamente para malhas 3D OpenGL ES com normais de iluminação e pintura!
+// diretamente para malhas 3D OpenGL ES com normais de iluminação e UVs!
 // ============================================================================
 static void DecodePS2VIFPart(const u8* a02, size_t a02Len, const std::string& partName,
-                             bool isPolice, DecodedPS2Car& outCar) {
+                             bool isPolice, DecodedPS2Mesh& outMesh) {
     bool isWheel = (partName.find("TIRE") != std::string::npos || partName.find("BRAKE_") != std::string::npos);
     bool isWindow = (partName.find("WINDOW") != std::string::npos);
     bool isBrakelight = (partName.find("BRAKELIGHT") != std::string::npos);
@@ -235,7 +314,7 @@ static void DecodePS2VIFPart(const u8* a02, size_t a02Len, const std::string& pa
                         v.z += oz;
                     }
 
-                    // Converte Triangle Strip para Triângulos OpenGL filtrando saltos de strip
+                    // Converte Triangle Strip para Triângulos OpenGL
                     for (size_t i = 2; i < batch.size(); ++i) {
                         const RawV& v0 = (i % 2 == 0) ? batch[i - 2] : batch[i - 1];
                         const RawV& v1 = (i % 2 == 0) ? batch[i - 1] : batch[i - 2];
@@ -247,7 +326,7 @@ static void DecodePS2VIFPart(const u8* a02, size_t a02Len, const std::string& pa
                         };
                         float d01 = dist3(v0, v1), d12 = dist3(v1, v2), d02 = dist3(v0, v2);
                         if (std::min({d01, d12, d02}) < 0.0004f) continue;
-                        if (std::max({d01, d12, d02}) > 0.88f) continue;
+                        if (std::max({d01, d12, d02}) > 1.25f) continue;
 
                         const RawV* tri[3] = {&v0, &v1, &v2};
                         for (int tv = 0; tv < 3; ++tv) {
@@ -259,66 +338,62 @@ static void DecodePS2VIFPart(const u8* a02, size_t a02Len, const std::string& pa
                             float gnx = -pt.ny;
                             float gny = pt.nz;
                             float gnz = pt.nx;
+                            float gu = pt.u;
+                            float gv = pt.v;
 
-                            // Determina a cor/material real da peça
-                            float r = 0.80f, g = 0.83f, b = 0.88f, a = 1.0f;
+                            // Cores e materiais base
+                            float r = 0.90f, g = 0.90f, b = 0.92f, a = 1.0f;
 
                             if (isWheel) {
                                 float rad = std::sqrt(pt.x * pt.x + pt.z * pt.z);
-                                if (rad > 0.225f) {
-                                    // Pneu de borracha preta Slick
-                                    r = 0.11f; g = 0.11f; b = 0.13f;
-                                } else {
-                                    // Aro esportivo BBS Prata Cromado
-                                    r = 0.82f; g = 0.85f; b = 0.90f;
-                                }
+                                if (rad > 0.225f) { r = 0.12f; g = 0.12f; b = 0.14f; }
+                                else              { r = 0.85f; g = 0.88f; b = 0.92f; }
                             } else if (isCopLights) {
-                                r = 0.95f; g = 0.95f; b = 0.98f;
+                                r = 0.98f; g = 0.98f; b = 1.0f;
                             } else if (isBrakelight) {
                                 r = 1.0f; g = 0.10f; b = 0.08f;
                             } else if (isHeadlight) {
-                                r = 0.92f; g = 0.96f; b = 1.0f;
+                                r = 0.95f; g = 0.98f; b = 1.0f;
                             } else if (isWindow) {
-                                r = 0.14f; g = 0.19f; b = 0.27f;
+                                r = 0.16f; g = 0.22f; b = 0.30f;
                             } else if (isInterior) {
                                 r = 0.18f; g = 0.20f; b = 0.24f;
                             } else if (isPolice) {
-                                // Pintura Oficial Rockport PD (Portas e Teto Brancos, Frente/Traseira Preta)
                                 if (std::abs(pt.x) < 1.15f && pt.z > 0.25f) {
-                                    r = 0.92f; g = 0.94f; b = 0.96f;
+                                    r = 0.95f; g = 0.96f; b = 0.98f;
                                 } else {
                                     r = 0.10f; g = 0.11f; b = 0.14f;
                                 }
                             } else if (isBase) {
                                 r = 0.16f; g = 0.17f; b = 0.20f;
                             } else {
-                                // Pintura Icônica da BMW M3 GTR (Prata Metálico + Vinil Azul Royal Most Wanted + Aerofólio Carbono)
+                                // Cores M3 GTR
                                 float absY = std::abs(pt.y);
                                 bool isRearWing = (pt.x < -1.52f && pt.z > 0.80f);
                                 bool isFrontSplitter = (pt.x > 1.92f && pt.z < 0.22f);
                                 bool isGrille = (pt.x > 2.22f && absY < 0.36f && pt.z < 0.56f);
-                                bool isBlueStripeHoodRoof = (pt.z > 0.52f && absY > 0.16f && absY < 0.46f && pt.x > -1.45f);
-                                bool isBlueVinylSide = (absY > 0.68f && pt.z > 0.24f && pt.z < 0.66f &&
-                                                        ((pt.x > -0.85f && pt.x < 0.95f) || (pt.x > 1.15f && pt.x < 1.95f)));
-                                bool isBlueRearQuarter = (absY > 0.55f && pt.x < -0.95f && pt.x > -1.85f && pt.z > 0.42f && pt.z < 0.78f);
+                                bool isBlueStripe = (pt.z > 0.52f && absY > 0.16f && absY < 0.46f && pt.x > -1.45f);
+                                bool isBlueSide = (absY > 0.68f && pt.z > 0.24f && pt.z < 0.66f &&
+                                                  ((pt.x > -0.85f && pt.x < 0.95f) || (pt.x > 1.15f && pt.x < 1.95f)));
+                                bool isBlueRear = (absY > 0.55f && pt.x < -0.95f && pt.x > -1.85f && pt.z > 0.42f && pt.z < 0.78f);
 
                                 if (isRearWing || isFrontSplitter || isGrille) {
-                                    r = 0.12f; g = 0.13f; b = 0.16f; // Fibra de Carbono
-                                } else if (isBlueStripeHoodRoof || isBlueVinylSide || isBlueRearQuarter) {
-                                    r = 0.06f; g = 0.30f; b = 0.84f; // Azul Royal BMW M3 GTR Most Wanted
+                                    r = 0.12f; g = 0.13f; b = 0.16f;
+                                } else if (isBlueStripe || isBlueSide || isBlueRear) {
+                                    r = 0.08f; g = 0.34f; b = 0.88f;
                                 } else {
-                                    r = 0.82f; g = 0.85f; b = 0.90f; // Prata Metálico Titanium Silver
+                                    r = 0.85f; g = 0.88f; b = 0.93f;
                                 }
                             }
 
-                            LitVertex lv{gx, gy, gz, gnx, gny, gnz, r, g, b, a};
+                            LitVertex lv{gx, gy, gz, gnx, gny, gnz, gu, gv, r, g, b, a};
                             if (isWheel) {
-                                outCar.wheelVerts.push_back(lv);
+                                outMesh.wheelVerts.push_back(lv);
                             } else if (isCopLights) {
-                                if (gx < 0.0f) outCar.sirenLVerts.push_back(lv);
-                                else           outCar.sirenRVerts.push_back(lv);
+                                if (gx < 0.0f) outMesh.sirenLVerts.push_back(lv);
+                                else           outMesh.sirenRVerts.push_back(lv);
                             } else {
-                                outCar.bodyVerts.push_back(lv);
+                                outMesh.bodyVerts.push_back(lv);
                             }
                         }
                     }
@@ -336,13 +411,12 @@ static void DecodePS2VIFPart(const u8* a02, size_t a02Len, const std::string& pa
     }
 }
 
-static DecodedPS2Car LoadPS2CarFromAsset(AAssetManager* mgr, const char* assetPath, bool isPolice) {
-    DecodedPS2Car car;
+static DecodedPS2Mesh LoadPS2Geometry(AAssetManager* mgr, const char* assetPath, const std::string& targetPartFilter, bool isPolice) {
+    DecodedPS2Mesh mesh;
     std::vector<u8> data = ReadAssetBytes(mgr, assetPath);
-    if (data.size() < 16) return car;
+    if (data.size() < 16) return mesh;
 
-    car.bodyVerts.reserve(30000);
-    car.wheelVerts.reserve(4000);
+    mesh.bodyVerts.reserve(25000);
 
     size_t pos = 8;
     size_t end = data.size();
@@ -389,41 +463,54 @@ static DecodedPS2Car LoadPS2CarFromAsset(AAssetManager* mgr, const char* assetPa
                 subpos += 8 + sl;
             }
 
-            // Seleciona as peças principais LOD _B (sem duplicar estilos de capô ou peças amassadas DAMAGE1)
             bool shouldDecode = false;
-            if (partName.size() >= 2 && partName.substr(partName.size() - 2) == "_B") {
-                if (partName.find("STYLE") == std::string::npos &&
-                    partName.find("DAMAGE1") == std::string::npos &&
-                    (isPolice || partName.find("DAMAGE0") == std::string::npos)) {
+            if (targetPartFilter.empty()) {
+                // Carro: LOD _B
+                if (partName.size() >= 2 && partName.substr(partName.size() - 2) == "_B") {
+                    if (partName.find("STYLE") == std::string::npos &&
+                        partName.find("DAMAGE1") == std::string::npos &&
+                        (isPolice || partName.find("DAMAGE0") == std::string::npos)) {
+                        shouldDecode = true;
+                    }
+                }
+            } else {
+                // Cenário: filtra por nome específico (ex: "XB_SHOPBLOCKC", "XB_HOUSEE", "SKYDOME", etc.)
+                if (partName.find(targetPartFilter) != std::string::npos) {
                     shouldDecode = true;
                 }
             }
 
             if (shouldDecode && a02Ptr && a02Len > 0) {
-                DecodePS2VIFPart(a02Ptr, a02Len, partName, isPolice, car);
+                DecodePS2VIFPart(a02Ptr, a02Len, partName, isPolice, mesh);
                 decodedParts++;
             }
         }
         pos += 8 + clen;
     }
 
-    car.loaded = !car.bodyVerts.empty();
-    LOGI("Modelo PS2 '%s' decodificado: %d partes, %zu vertices chassi, %zu vertices roda",
-         assetPath, decodedParts, car.bodyVerts.size(), car.wheelVerts.size());
-    return car;
+    mesh.loaded = !mesh.bodyVerts.empty();
+    LOGI("Geometria PS2 '%s' [%s]: %d partes, %zu vertices chassi, %zu vertices roda",
+         assetPath, targetPartFilter.c_str(), decodedParts, mesh.bodyVerts.size(), mesh.wheelVerts.size());
+    return mesh;
 }
 
-// Shaders OpenGL ES com iluminação direcional + reflexo especular metálico (EAGL4 Car Paint)
+// Shaders OpenGL ES com suporte a Textura 2D + Iluminação EAGL4
 static const char* kVertexShaderSrc = R"(
 attribute vec3 aPos;
 attribute vec3 aNormal;
+attribute vec2 aUV;
 attribute vec4 aColor;
 uniform mat4 uMVP;
 uniform mat4 uModel;
 uniform float uUseLit;
+uniform float uUseTex;
 varying vec4 vColor;
+varying vec2 vUV;
+varying float vUseTex;
 void main() {
     gl_Position = uMVP * uModel * vec4(aPos, 1.0);
+    vUV = aUV;
+    vUseTex = uUseTex;
     if (uUseLit > 0.5) {
         vec3 N = normalize(mat3(uModel[0].xyz, uModel[1].xyz, uModel[2].xyz) * aNormal);
         vec3 L = normalize(vec3(0.45, 0.82, -0.35));
@@ -443,8 +530,16 @@ void main() {
 static const char* kFragmentShaderSrc = R"(
 precision mediump float;
 varying vec4 vColor;
+varying vec2 vUV;
+varying float vUseTex;
+uniform sampler2D uTexture;
 void main() {
-    gl_FragColor = vColor;
+    if (vUseTex > 0.5) {
+        vec4 tex = texture2D(uTexture, vUV);
+        gl_FragColor = tex * vColor;
+    } else {
+        gl_FragColor = vColor;
+    }
 }
 )";
 
@@ -465,12 +560,15 @@ static void InitSceneShaders(struct EngineState* engine) {
     glDeleteShader(vs);
     glDeleteShader(fs);
 
-    engine->aPosLoc    = glGetAttribLocation(engine->program, "aPos");
-    engine->aNormalLoc = glGetAttribLocation(engine->program, "aNormal");
-    engine->aColorLoc  = glGetAttribLocation(engine->program, "aColor");
-    engine->uMvpLoc    = glGetUniformLocation(engine->program, "uMVP");
-    engine->uModelLoc  = glGetUniformLocation(engine->program, "uModel");
-    engine->uUseLitLoc = glGetUniformLocation(engine->program, "uUseLit");
+    engine->aPosLoc     = glGetAttribLocation(engine->program, "aPos");
+    engine->aNormalLoc  = glGetAttribLocation(engine->program, "aNormal");
+    engine->aUVLoc      = glGetAttribLocation(engine->program, "aUV");
+    engine->aColorLoc   = glGetAttribLocation(engine->program, "aColor");
+    engine->uMvpLoc     = glGetUniformLocation(engine->program, "uMVP");
+    engine->uModelLoc   = glGetUniformLocation(engine->program, "uModel");
+    engine->uUseLitLoc  = glGetUniformLocation(engine->program, "uUseLit");
+    engine->uUseTexLoc  = glGetUniformLocation(engine->program, "uUseTex");
+    engine->uTextureLoc = glGetUniformLocation(engine->program, "uTexture");
 }
 
 // Matemática de Matrizes 4x4 (Column-Major)
@@ -568,17 +666,17 @@ struct Mat4 {
 };
 
 static void PushQuad3D(std::vector<LitVertex>& v,
-                       float x1, float y1, float z1,
-                       float x2, float y2, float z2,
-                       float x3, float y3, float z3,
-                       float x4, float y4, float z4,
+                       float x1, float y1, float z1, float u1, float v1,
+                       float x2, float y2, float z2, float u2, float v2,
+                       float x3, float y3, float z3, float u3, float v3,
+                       float x4, float y4, float z4, float u4, float v4,
                        float r, float g, float b, float a = 1.0f) {
-    v.push_back({x1, y1, z1, 0.0f, 1.0f, 0.0f, r, g, b, a});
-    v.push_back({x2, y2, z2, 0.0f, 1.0f, 0.0f, r, g, b, a});
-    v.push_back({x3, y3, z3, 0.0f, 1.0f, 0.0f, r, g, b, a});
-    v.push_back({x1, y1, z1, 0.0f, 1.0f, 0.0f, r, g, b, a});
-    v.push_back({x3, y3, z3, 0.0f, 1.0f, 0.0f, r, g, b, a});
-    v.push_back({x4, y4, z4, 0.0f, 1.0f, 0.0f, r, g, b, a});
+    v.push_back({x1, y1, z1, 0.0f, 1.0f, 0.0f, u1, v1, r, g, b, a});
+    v.push_back({x2, y2, z2, 0.0f, 1.0f, 0.0f, u2, v2, r, g, b, a});
+    v.push_back({x3, y3, z3, 0.0f, 1.0f, 0.0f, u3, v3, r, g, b, a});
+    v.push_back({x1, y1, z1, 0.0f, 1.0f, 0.0f, u1, v1, r, g, b, a});
+    v.push_back({x3, y3, z3, 0.0f, 1.0f, 0.0f, u3, v3, r, g, b, a});
+    v.push_back({x4, y4, z4, 0.0f, 1.0f, 0.0f, u4, v4, r, g, b, a});
 }
 
 static void PushBox3D(std::vector<LitVertex>& v,
@@ -588,31 +686,43 @@ static void PushBox3D(std::vector<LitVertex>& v,
     float x0 = cx - hx, x1 = cx + hx;
     float y0 = cy - hy, y1 = cy + hy;
     float z0 = cz - hz, z1 = cz + hz;
-    PushQuad3D(v, x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1, r * 1.1f, g * 1.1f, b * 1.1f, a);
-    PushQuad3D(v, x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, r * 0.90f, g * 0.90f, b * 0.90f, a);
-    PushQuad3D(v, x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, r * 0.95f, g * 0.95f, b * 0.95f, a);
-    PushQuad3D(v, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, r * 0.78f, g * 0.78f, b * 0.78f, a);
-    PushQuad3D(v, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, r * 0.78f, g * 0.78f, b * 0.78f, a);
+    PushQuad3D(v, x0, y1, z0, 0, 0, x1, y1, z0, 1, 0, x1, y1, z1, 1, 1, x0, y1, z1, 0, 1, r * 1.1f, g * 1.1f, b * 1.1f, a);
+    PushQuad3D(v, x1, y0, z0, 0, 0, x0, y0, z0, 1, 0, x0, y1, z0, 1, 1, x1, y1, z0, 0, 1, r * 0.90f, g * 0.90f, b * 0.90f, a);
+    PushQuad3D(v, x0, y0, z1, 0, 0, x1, y0, z1, 1, 0, x1, y1, z1, 1, 1, x0, y1, z1, 0, 1, r * 0.95f, g * 0.95f, b * 0.95f, a);
+    PushQuad3D(v, x0, y0, z0, 0, 0, x0, y0, z1, 1, 0, x0, y1, z1, 1, 1, x0, y1, z0, 0, 1, r * 0.78f, g * 0.78f, b * 0.78f, a);
+    PushQuad3D(v, x1, y0, z1, 0, 0, x1, y0, z0, 1, 0, x1, y1, z0, 1, 1, x1, y1, z1, 0, 1, r * 0.78f, g * 0.78f, b * 0.78f, a);
 }
 
 static void PushRect2D(std::vector<LitVertex>& v,
                        float x0, float y0, float x1, float y1,
+                       float u0, float v0, float u1, float v1,
                        float r, float g, float b, float a = 1.0f) {
-    PushQuad3D(v, x0, y0, 0.0f, x1, y0, 0.0f, x1, y1, 0.0f, x0, y1, 0.0f, r, g, b, a);
+    PushQuad3D(v, x0, y0, 0.0f, u0, v0, x1, y0, 0.0f, u1, v0, x1, y1, 0.0f, u1, v1, x0, y1, 0.0f, u0, v1, r, g, b, a);
 }
 
-static void DrawMeshBuffer(struct EngineState* engine, const std::vector<LitVertex>& verts, const Mat4& modelMat, bool useLit) {
+static void DrawMeshBuffer(struct EngineState* engine, const std::vector<LitVertex>& verts, const Mat4& modelMat, bool useLit, GLuint textureId = 0) {
     if (verts.empty()) return;
     glUniformMatrix4fv(engine->uModelLoc, 1, GL_FALSE, modelMat.m);
     glUniform1f(engine->uUseLitLoc, useLit ? 1.0f : 0.0f);
+
+    if (textureId != 0) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, textureId);
+        glUniform1f(engine->uUseTexLoc, 1.0f);
+        glUniform1i(engine->uTextureLoc, 0);
+    } else {
+        glUniform1f(engine->uUseTexLoc, 0.0f);
+    }
+
     glVertexAttribPointer(engine->aPosLoc,    3, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].x);
     glVertexAttribPointer(engine->aNormalLoc, 3, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].nx);
+    glVertexAttribPointer(engine->aUVLoc,     2, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].u);
     glVertexAttribPointer(engine->aColorLoc,  4, GL_FLOAT, GL_FALSE, sizeof(LitVertex), &verts[0].r);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
 }
 
-// Renderiza um veículo PS2 real (Chassi + 4 Rodas 3D girando e esterçando)
-static void RenderPS2Vehicle(struct EngineState* engine, const DecodedPS2Car& carMesh,
+// Renderiza um veículo PS2 real com textura do carro (Vinil Hero / Viatura Policial / Rodas)
+static void RenderPS2Vehicle(struct EngineState* engine, const DecodedPS2Mesh& carMesh,
                              float wx, float wy, float wz, float yawRad, float rollRad,
                              float steerRad, float wheelSpinRad, bool isPolice, float animTime, int unitIdx) {
     if (!carMesh.loaded) return;
@@ -622,10 +732,13 @@ static void RenderPS2Vehicle(struct EngineState* engine, const DecodedPS2Car& ca
         Mat4::Multiply(Mat4::RotateY(yawRad), Mat4::RotateZ(rollRad))
     );
 
-    // 1. Renderiza todos os ~8.200 triângulos reais da carroceria/interior/vidros/faróis do PS2
-    DrawMeshBuffer(engine, carMesh.bodyVerts, carTransform, true);
+    GLuint carTex = isPolice ? engine->texMgr.Get("COPMIDSIZE_SKIN1") : engine->texMgr.Get("BMWM3GTRE46_CE02");
+    GLuint tireTex = engine->texMgr.Get("BMWM3GTRE46_TIRE");
 
-    // 2. Se for viatura policial (COPMIDSIZE), pisca o giroflex 3D real no teto
+    // 1. Renderiza a carroceria/vidros/faróis com a textura do carro
+    DrawMeshBuffer(engine, carMesh.bodyVerts, carTransform, true, carTex);
+
+    // 2. Se for viatura policial, pisca o giroflex
     if (isPolice && (!carMesh.sirenLVerts.empty() || !carMesh.sirenRVerts.empty())) {
         bool flash = (static_cast<int>(animTime * 10.0f + unitIdx) % 2) == 0;
         std::vector<LitVertex> sirenVerts;
@@ -638,19 +751,18 @@ static void RenderPS2Vehicle(struct EngineState* engine, const DecodedPS2Car& ca
             v.r = flash ? 0.1f : 1.0f; v.g = 0.05f; v.b = flash ? 1.0f : 0.1f;
             sirenVerts.push_back(v);
         }
-        DrawMeshBuffer(engine, sirenVerts, carTransform, false);
+        DrawMeshBuffer(engine, sirenVerts, carTransform, false, 0);
     }
 
     // 3. Renderiza as 4 Rodas 3D reais (FRONT_TIRE_B) nos 4 cubos de roda
     if (!carMesh.wheelVerts.empty()) {
-        const float wheelX[2] = { -0.76f, +0.76f }; // Esquerda (-X) e Direita (+X)
-        const float wheelZ[2] = { +1.37f, -1.26f }; // Dianteira (+Z) e Traseira (-Z)
+        const float wheelX[2] = { -0.76f, +0.76f };
+        const float wheelZ[2] = { +1.37f, -1.26f };
         const float wheelY    = 0.335f;
 
         for (int side = 0; side < 2; ++side) {
             for (int axle = 0; axle < 2; ++axle) {
                 float steer = (axle == 0) ? steerRad : 0.0f;
-                // Espelha o eixo X para as rodas do lado direito para a calota BBS ficar voltada para fora
                 float mirrorX = (side == 1) ? -1.0f : 1.0f;
                 Mat4 wLocal = Mat4::Multiply(
                     Mat4::Translate(wheelX[side], wheelY, wheelZ[axle]),
@@ -660,7 +772,7 @@ static void RenderPS2Vehicle(struct EngineState* engine, const DecodedPS2Car& ca
                     )
                 );
                 Mat4 wWorld = Mat4::Multiply(carTransform, wLocal);
-                DrawMeshBuffer(engine, carMesh.wheelVerts, wWorld, true);
+                DrawMeshBuffer(engine, carMesh.wheelVerts, wWorld, true, tireTex);
             }
         }
     }
@@ -670,23 +782,31 @@ static void LoadAllBlackEditionAssets(struct EngineState* engine) {
     if (!engine->app || !engine->app->activity || !engine->app->activity->assetManager) return;
     AAssetManager* mgr = engine->app->activity->assetManager;
 
-    // 1. Carrega ZDIR.BIN oficial do Need for Speed: Most Wanted - Black Edition (BR)
+    // 1. Carrega todas as texturas reais descompactadas e decodificadas do PS2
+    engine->texMgr.LoadPackFromAsset(mgr, "textures/PS2_TEXTURES.BIN");
+
+    // 2. Carrega ZDIR.BIN oficial do Need for Speed: Most Wanted - Black Edition (BR)
     auto zdir = ReadAssetBytes(mgr, "ZDIR.BIN");
     engine->zdirEntries = zdir.size() / 24;
-
-    // 2. Carrega TEXTURES.BIN (CarTemplateTextures_BMWM3GTRE46.tpk e BMWM3)
-    auto tpk1 = ReadAssetBytes(mgr, "bmwm3gtre46/TEXTURES.BIN");
-    auto tpk2 = ReadAssetBytes(mgr, "bmwm3/TEXTURES.BIN");
-    engine->tpkTexturesCount = (!tpk1.empty() ? 8 : 0) + (!tpk2.empty() ? 10 : 0);
 
     // 3. Carrega GAMEPLAY.BIN de Rockport
     auto gp = ReadAssetBytes(mgr, "global/GAMEPLAY.BIN");
     engine->gameplayEventsCount = gp.size() / 1024;
 
-    // 4. Decodifica a geometria 3D real da BMW M3 GTR E46 (Race Hero), BMW M3 (Street) e Viatura Policial (COPMIDSIZE)
-    engine->m3GtrRace  = LoadPS2CarFromAsset(mgr, "bmwm3gtre46/GEOMETRY.BIN", false);
-    engine->m3Street   = LoadPS2CarFromAsset(mgr, "bmwm3/GEOMETRY.BIN", false);
-    engine->copCruiser = LoadPS2CarFromAsset(mgr, "copmidsize/GEOMETRY.BIN", true);
+    // 4. Decodifica a geometria 3D real dos carros
+    engine->m3GtrRace  = LoadPS2Geometry(mgr, "bmwm3gtre46/GEOMETRY.BIN", "", false);
+    engine->m3Street   = LoadPS2Geometry(mgr, "bmwm3/GEOMETRY.BIN", "", false);
+    engine->copCruiser = LoadPS2Geometry(mgr, "copmidsize/GEOMETRY.BIN", "", true);
+
+    // 5. Decodifica o Cenário 3D Real de Rockport (Record #28: SCENERY_L2RA.BIN)
+    engine->sceneryShop    = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "XB_SHOPBLOCKC", false);
+    engine->sceneryHouse   = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "XB_HOUSEE", false);
+    engine->sceneryFactory = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "XB_IF_OLDFACTORYE", false);
+    engine->sceneryTruss   = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "XO_FWY_SIGNSUPPORTTRUSS", false);
+    engine->sceneryLight   = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "XO_STREETLIGHTCB", false);
+    engine->sceneryBarrier = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "XW_BARRCONCHWY8M", false);
+    engine->sceneryTree    = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "XT_CT_FALLTREED", false);
+    engine->scenerySky     = LoadPS2Geometry(mgr, "rockport/SCENERY_L2RA.BIN", "SKYDOME", false);
 }
 
 static int InitDisplay(struct EngineState* engine) {
@@ -718,12 +838,8 @@ static int InitDisplay(struct EngineState* engine) {
     eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format);
     ANativeWindow_setBuffersGeometry(engine->app->window, 0, 0, format);
 
-    EGLint ctxAttribs3[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs3);
-    if (context == EGL_NO_CONTEXT) {
-        EGLint ctxAttribs2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-        context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
-    }
+    EGLint ctxAttribs2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
 
     EGLSurface surface = eglCreateWindowSurface(display, config, engine->app->window, nullptr);
     if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT) return -1;
@@ -746,7 +862,7 @@ static int InitDisplay(struct EngineState* engine) {
         LoadAllBlackEditionAssets(engine);
     }
 
-    LOGI("Renderizador EAGL4 -> OpenGL ES pronto (%dx%d) com ativos reais da Black Edition (BR)!", w, h);
+    LOGI("Renderizador EAGL4 -> OpenGL ES pronto (%dx%d) com texturas e cenarios reais da Black Edition (BR)!", w, h);
     return 0;
 }
 
@@ -765,22 +881,23 @@ static void DrawFrame(struct EngineState* engine) {
     float speedMps = engine->car.GetSpeedKmh() / 3.6f;
     engine->wheelSpinAngle += (speedMps / 0.34f) * dt;
 
-    // 2. Limpa o Framebuffer com o Céu Dourado/Sépia de Rockport
+    // 2. Limpa o Framebuffer com a Cor de Pôr do Sol de Rockport
     glViewport(0, 0, engine->width, engine->height);
-    glClearColor(0.76f, 0.58f, 0.34f, 1.0f);
+    glClearColor(0.82f, 0.58f, 0.30f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glEnable(GL_DEPTH_TEST);
 
     glUseProgram(engine->program);
     glEnableVertexAttribArray(engine->aPosLoc);
     glEnableVertexAttribArray(engine->aNormalLoc);
+    glEnableVertexAttribArray(engine->aUVLoc);
     glEnableVertexAttribArray(engine->aColorLoc);
 
     // 3. Configura Câmera de Perseguição em 3ª Pessoa
     float aspect = (engine->height > 0) ? (static_cast<float>(engine->width) / static_cast<float>(engine->height)) : 1.77f;
     bool nosFiring = (engine->touchNos && engine->car.GetNosRemaining() > 1.0f);
     float fovDeg = nosFiring ? 70.0f : 58.0f;
-    Mat4 proj = Mat4::Perspective(fovDeg * 3.14159265f / 180.0f, aspect, 0.5f, 240.0f);
+    Mat4 proj = Mat4::Perspective(fovDeg * 3.14159265f / 180.0f, aspect, 0.5f, 320.0f);
 
     float camX = carPos.x * 0.82f - engine->touchSteer * 0.75f;
     float camY = 1.95f;
@@ -791,67 +908,133 @@ static void DrawFrame(struct EngineState* engine) {
     Mat4 mvp = Mat4::Multiply(proj, view);
     glUniformMatrix4fv(engine->uMvpLoc, 1, GL_FALSE, mvp.m);
 
-    // 4. Constrói e Renderiza a Rodovia de Rockport
-    std::vector<LitVertex> roadVerts;
-    roadVerts.reserve(2048);
+    // 4. Renderiza o Horizonte de Pôr do Sol de Rockport (PAN_COLLEGETOWN_MOUNT_F)
+    GLuint skyTex = engine->texMgr.Get("PAN_COLLEGETOWN_MOUNT_F");
+    std::vector<LitVertex> skyVerts;
+    float skyZ = carPos.z + 240.0f;
+    PushQuad3D(skyVerts, -360.0f, 0.0f, skyZ, 0.0f, 1.0f,
+                          360.0f, 0.0f, skyZ, 1.0f, 1.0f,
+                          360.0f, 95.0f, skyZ, 1.0f, 0.0f,
+                         -360.0f, 95.0f, skyZ, 0.0f, 0.0f,
+                          1.0f, 1.0f, 1.0f, 1.0f);
+    DrawMeshBuffer(engine, skyVerts, Mat4::Identity(), false, skyTex);
 
+    // 5. Renderiza a Pista de Asfalto Real de Rockport (TRNS_ALL_LA_PAVEMENTA_Y)
+    GLuint roadTex = engine->texMgr.Get("TRNS_ALL_LA_PAVEMENTA_Y");
     float zBase = std::floor(carPos.z / 10.0f) * 10.0f;
-    float zStart = zBase - 40.0f;
-    float zEnd = zBase + 190.0f;
+    float zStart = zBase - 50.0f;
+    float zEnd = zBase + 210.0f;
+    float vReps = (zEnd - zStart) * 0.12f;
 
-    PushQuad3D(roadVerts, -120.0f, -0.05f, zStart, 120.0f, -0.05f, zStart,
-                          120.0f, -0.05f, zEnd, -120.0f, -0.05f, zEnd, 0.32f, 0.28f, 0.18f);
-    PushQuad3D(roadVerts, -12.0f, 0.0f, zStart, 12.0f, 0.0f, zStart,
-                          12.0f, 0.0f, zEnd, -12.0f, 0.0f, zEnd, 0.16f, 0.17f, 0.19f);
+    std::vector<LitVertex> roadVerts;
+    roadVerts.reserve(256);
+    // Terreno ao redor
+    PushQuad3D(roadVerts, -140.0f, -0.05f, zStart, 0.0f, 0.0f,
+                           140.0f, -0.05f, zStart, 1.0f, 0.0f,
+                           140.0f, -0.05f, zEnd,   1.0f, vReps * 0.2f,
+                          -140.0f, -0.05f, zEnd,   0.0f, vReps * 0.2f,
+                           0.40f, 0.35f, 0.22f);
+    // Rodovia de Asfalto Rockport Texturizada
+    PushQuad3D(roadVerts, -11.5f, 0.0f, zStart, 0.0f, 0.0f,
+                           11.5f, 0.0f, zStart, 1.0f, 0.0f,
+                           11.5f, 0.0f, zEnd,   1.0f, vReps,
+                          -11.5f, 0.0f, zEnd,   0.0f, vReps,
+                           1.0f, 1.0f, 1.0f);
+    DrawMeshBuffer(engine, roadVerts, Mat4::Identity(), true, roadTex);
 
-    for (int seg = -4; seg < 19; ++seg) {
+    // 6. Renderiza as Barreiras de Concreto e Setas Neon de Rockport
+    GLuint barrierTex = engine->texMgr.Get("OBJ_BARRIERCONCRETE_06_");
+    GLuint neonArrowTex = engine->texMgr.Get("SFX_TRACKBARRIERNEONARR");
+    std::vector<LitVertex> barrierVerts;
+    barrierVerts.reserve(512);
+
+    for (int seg = -4; seg < 21; ++seg) {
         float sz0 = zBase + seg * 10.0f;
-        float sz1 = sz0 + 5.0f;
-        float sz2 = sz0 + 10.0f;
+        // Barreira esquerda e direita texturizadas
+        PushBox3D(barrierVerts, -12.1f, 0.42f, sz0 + 5.0f, 0.32f, 0.42f, 5.0f, 1.0f, 1.0f, 1.0f);
+        PushBox3D(barrierVerts,  12.1f, 0.42f, sz0 + 5.0f, 0.32f, 0.42f, 5.0f, 1.0f, 1.0f, 1.0f);
+    }
+    DrawMeshBuffer(engine, barrierVerts, Mat4::Identity(), true, barrierTex);
 
-        PushQuad3D(roadVerts, -0.25f, 0.02f, sz0, -0.08f, 0.02f, sz0,
-                              -0.08f, 0.02f, sz2, -0.25f, 0.02f, sz2, 0.95f, 0.75f, 0.12f);
-        PushQuad3D(roadVerts,  0.08f, 0.02f, sz0,  0.25f, 0.02f, sz0,
-                               0.25f, 0.02f, sz2,  0.08f, 0.02f, sz2, 0.95f, 0.75f, 0.12f);
-        PushQuad3D(roadVerts, -6.1f, 0.02f, sz0, -5.9f, 0.02f, sz0,
-                              -5.9f, 0.02f, sz1, -6.1f, 0.02f, sz1, 0.88f, 0.88f, 0.90f);
-        PushQuad3D(roadVerts,  5.9f, 0.02f, sz0,  6.1f, 0.02f, sz0,
-                               6.1f, 0.02f, sz1,  5.9f, 0.02f, sz1, 0.88f, 0.88f, 0.90f);
+    // Setas de Curva Neon Brilhantes (SFX_TRACKBARRIERNEONARR) a cada 40m
+    std::vector<LitVertex> neonVerts;
+    for (int seg = -4; seg < 21; seg += 4) {
+        float sz0 = zBase + seg * 10.0f;
+        PushQuad3D(neonVerts, 11.75f, 0.20f, sz0 + 2.0f, 0.0f, 1.0f,
+                              11.75f, 0.20f, sz0 + 6.0f, 1.0f, 1.0f,
+                              11.75f, 0.85f, sz0 + 6.0f, 1.0f, 0.0f,
+                              11.75f, 0.85f, sz0 + 2.0f, 0.0f, 0.0f,
+                              1.0f, 0.95f, 0.20f, 1.0f);
+    }
+    DrawMeshBuffer(engine, neonVerts, Mat4::Identity(), false, neonArrowTex);
 
-        bool isRed = (seg % 2 == 0);
-        PushBox3D(roadVerts, -12.4f, 0.35f, sz0 + 5.0f, 0.35f, 0.35f, 5.0f, isRed ? 0.85f : 0.92f, isRed ? 0.18f : 0.92f, isRed ? 0.15f : 0.92f);
-        PushBox3D(roadVerts,  12.4f, 0.35f, sz0 + 5.0f, 0.35f, 0.35f, 5.0f, isRed ? 0.85f : 0.92f, isRed ? 0.18f : 0.92f, isRed ? 0.15f : 0.92f);
+    // 7. Renderiza os Prédios e Fábricas de Rockport (3D da Black Edition BR)
+    GLuint factoryTex = engine->texMgr.Get("ARC_FACTORYBRICK_01");
+    GLuint campusTex  = engine->texMgr.Get("ARC_CAMPUS_HERITAGE4_WA");
+    for (int seg = -2; seg < 18; seg += 3) {
+        float sz = zBase + seg * 12.0f;
+        // Se a malha 3D real da fábrica/prédio de Rockport estiver carregada, posiciona-a
+        if (engine->sceneryFactory.loaded) {
+            Mat4 bldgL = Mat4::Multiply(Mat4::Translate(-22.0f, 0.0f, sz), Mat4::RotateY(1.57f));
+            DrawMeshBuffer(engine, engine->sceneryFactory.bodyVerts, bldgL, true, factoryTex);
+        } else {
+            std::vector<LitVertex> bldgBox;
+            PushBox3D(bldgBox, -22.0f, 8.0f, sz, 5.5f, 8.0f, 5.0f, 1.0f, 1.0f, 1.0f);
+            DrawMeshBuffer(engine, bldgBox, Mat4::Identity(), true, factoryTex);
+        }
 
-        int worldSegIdx = static_cast<int>(std::floor(sz0 / 10.0f));
-        if (worldSegIdx % 2 == 0) {
-            float bHeight = 6.0f + (std::abs(worldSegIdx * 7) % 10);
-            float tint = 0.35f + (std::abs(worldSegIdx * 13) % 4) * 0.08f;
-            PushBox3D(roadVerts, -22.0f, bHeight * 0.5f, sz0 + 5.0f, 5.5f, bHeight * 0.5f, 4.2f, tint, tint * 0.88f, tint * 0.72f);
-            PushBox3D(roadVerts,  22.0f, bHeight * 0.5f, sz0 + 5.0f, 5.5f, bHeight * 0.5f, 4.2f, tint * 0.90f, tint * 0.82f, tint * 0.70f);
+        if (engine->sceneryShop.loaded) {
+            Mat4 bldgR = Mat4::Multiply(Mat4::Translate(22.0f, 0.0f, sz), Mat4::RotateY(-1.57f));
+            DrawMeshBuffer(engine, engine->sceneryShop.bodyVerts, bldgR, true, campusTex);
+        } else {
+            std::vector<LitVertex> bldgBox;
+            PushBox3D(bldgBox, 22.0f, 9.0f, sz, 5.5f, 9.0f, 5.0f, 1.0f, 1.0f, 1.0f);
+            DrawMeshBuffer(engine, bldgBox, Mat4::Identity(), true, campusTex);
         }
     }
 
-    // Sombra embaixo da BMW M3 GTR e Chamas de Nitro N2O
-    PushQuad3D(roadVerts, carPos.x - 1.02f, 0.02f, carPos.z - 2.25f, carPos.x + 1.02f, 0.02f, carPos.z - 2.25f,
-                          carPos.x + 1.02f, 0.02f, carPos.z + 2.35f, carPos.x - 1.02f, 0.02f, carPos.z + 2.35f,
-                          0.02f, 0.02f, 0.03f, 0.80f);
+    // 8. Treliça Suspensa de Rodovia com Placa "DOWNTOWN ROCKPORT" (a cada 90 metros)
+    GLuint signTex = engine->texMgr.Get("SGN_FWY_DOWNTOWNROCKPOR");
+    float trussZ = std::floor((carPos.z + 50.0f) / 90.0f) * 90.0f;
+    std::vector<LitVertex> trussVerts;
+    // Pilares e viga superior
+    PushBox3D(trussVerts, -12.2f, 3.8f, trussZ, 0.35f, 3.8f, 0.35f, 0.55f, 0.58f, 0.62f);
+    PushBox3D(trussVerts,  12.2f, 3.8f, trussZ, 0.35f, 3.8f, 0.35f, 0.55f, 0.58f, 0.62f);
+    PushBox3D(trussVerts,   0.0f, 7.3f, trussZ, 12.5f, 0.35f, 0.35f, 0.55f, 0.58f, 0.62f);
+    DrawMeshBuffer(engine, trussVerts, Mat4::Identity(), true, 0);
+
+    // Placa Verde Highway "DOWNTOWN ROCKPORT"
+    std::vector<LitVertex> signVerts;
+    PushQuad3D(signVerts, -5.5f, 5.2f, trussZ - 0.2f, 0.0f, 1.0f,
+                           5.5f, 5.2f, trussZ - 0.2f, 1.0f, 1.0f,
+                           5.5f, 7.1f, trussZ - 0.2f, 1.0f, 0.0f,
+                          -5.5f, 7.1f, trussZ - 0.2f, 0.0f, 0.0f,
+                           1.0f, 1.0f, 1.0f);
+    DrawMeshBuffer(engine, signVerts, Mat4::Identity(), false, signTex);
+
+    // 9. Sombra projetada no asfalto e Chamas do Nitro
+    std::vector<LitVertex> fxVerts;
+    PushQuad3D(fxVerts, carPos.x - 1.05f, 0.02f, carPos.z - 2.25f, 0, 0,
+                        carPos.x + 1.05f, 0.02f, carPos.z - 2.25f, 1, 0,
+                        carPos.x + 1.05f, 0.02f, carPos.z + 2.35f, 1, 1,
+                        carPos.x - 1.05f, 0.02f, carPos.z + 2.35f, 0, 1,
+                        0.02f, 0.02f, 0.03f, 0.85f);
     if (nosFiring) {
         float pulse = 0.65f + 0.35f * std::sin(engine->animTime * 45.0f);
-        PushBox3D(roadVerts, carPos.x - 0.32f, 0.22f, carPos.z - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
-        PushBox3D(roadVerts, carPos.x + 0.32f, 0.22f, carPos.z - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
+        PushBox3D(fxVerts, carPos.x - 0.32f, 0.22f, carPos.z - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
+        PushBox3D(fxVerts, carPos.x + 0.32f, 0.22f, carPos.z - 2.15f - pulse * 0.65f, 0.09f, 0.07f, pulse * 0.65f, 0.18f, 0.68f, 1.0f);
     }
+    DrawMeshBuffer(engine, fxVerts, Mat4::Identity(), false, 0);
 
-    DrawMeshBuffer(engine, roadVerts, Mat4::Identity(), false);
-
-    // 5. Renderiza a Malha 3D Real PS2 da BMW M3 GTR E46 (ou Street M3)
-    const DecodedPS2Car& activePlayerCar = (engine->useStreetM3 && engine->m3Street.loaded) ? engine->m3Street : engine->m3GtrRace;
+    // 10. Renderiza a Malha 3D Real PS2 da BMW M3 GTR E46
+    const DecodedPS2Mesh& activePlayerCar = (engine->useStreetM3 && engine->m3Street.loaded) ? engine->m3Street : engine->m3GtrRace;
     float carYaw   = engine->touchSteer * 0.14f;
     float carRoll  = -engine->touchSteer * 0.05f;
     float steerRad = engine->touchSteer * 0.42f;
     RenderPS2Vehicle(engine, activePlayerCar, carPos.x, 0.0f, carPos.z,
                      carYaw, carRoll, steerRad, engine->wheelSpinAngle, false, engine->animTime, 0);
 
-    // 6. Renderiza as Viaturas Policiais Crown Victoria Reais (COPMIDSIZE/GEOMETRY.BIN)
+    // 11. Renderiza as Viaturas Policiais Crown Victoria Reais
     const auto& cops = engine->pursuit.GetUnits();
     for (size_t i = 0; i < cops.size(); ++i) {
         if (cops[i].state == COP_WRECKED) continue;
@@ -859,64 +1042,102 @@ static void DrawFrame(struct EngineState* engine) {
                          0.0f, 0.0f, 0.0f, engine->wheelSpinAngle, true, engine->animTime, static_cast<int>(i));
     }
 
-    // 7. Renderiza o HUD 2D Interativo
+    // 12. Renderiza o HUD Autêntico do Need for Speed: Most Wanted
     glDisable(GL_DEPTH_TEST);
-    std::vector<LitVertex> hudVerts;
-    hudVerts.reserve(512);
-
-    // Barra Policial BUSTED / EVADE no Topo Central
-    PushRect2D(hudVerts, -0.45f, 0.84f, 0.45f, 0.93f, 0.08f, 0.08f, 0.10f, 0.85f);
-    bool hudFlash = (static_cast<int>(engine->animTime * 8.0f) % 2) == 0;
-    PushRect2D(hudVerts, -0.44f, 0.85f, -0.01f, 0.92f, hudFlash ? 0.90f : 0.25f, 0.10f, 0.10f, 1.0f);
-    PushRect2D(hudVerts,  0.01f, 0.85f,  0.44f, 0.92f, 0.10f, 0.35f, hudFlash ? 0.25f : 0.95f, 1.0f);
-
-    // Nível de Heat (1 a 5 no Topo Esquerdo)
-    int heat = static_cast<int>(engine->pursuit.GetCurrentHeat());
-    for (int h = 0; h < 5; ++h) {
-        float hx0 = -0.92f + h * 0.07f;
-        bool activeHeat = (h < heat);
-        PushRect2D(hudVerts, hx0, 0.84f, hx0 + 0.055f, 0.93f,
-                   activeHeat ? 1.0f : 0.22f, activeHeat ? 0.55f : 0.22f, activeHeat ? 0.08f : 0.25f, 1.0f);
-    }
-
-    // Indicador Verde no Topo Direito: Confirma que os arquivos .BIN da Black Edition (BR) estão ativos!
-    // (Tocar no topo direito alterna entre a BMW M3 GTR E46 Race e a BMW M3 Street!)
-    if (engine->m3GtrRace.loaded && engine->copCruiser.loaded) {
-        PushRect2D(hudVerts, 0.62f, 0.83f, 0.94f, 0.93f,
-                   engine->useStreetM3 ? 0.15f : 0.08f,
-                   engine->useStreetM3 ? 0.78f : 0.45f,
-                   engine->useStreetM3 ? 0.35f : 0.95f, 0.90f);
-    }
-
-    // Painel Direito Inferior: Velocímetro, RPM e Nitro (N2O)
-    float speedRatio = std::clamp(engine->car.GetSpeedKmh() / 320.0f, 0.0f, 1.0f);
-    float rpmRatio   = std::clamp(engine->car.GetRPM() / 8500.0f, 0.0f, 1.0f);
-    float nosRatio   = std::clamp(engine->car.GetNosRemaining() / 100.0f, 0.0f, 1.0f);
-
-    PushRect2D(hudVerts, 0.32f, -0.94f, 0.94f, -0.58f, 0.06f, 0.07f, 0.09f, 0.85f);
-    PushRect2D(hudVerts, 0.35f, -0.68f, 0.35f + speedRatio * 0.56f, -0.61f,
-               0.20f + speedRatio * 0.80f, 0.90f - speedRatio * 0.30f, 0.15f, 1.0f);
-    PushRect2D(hudVerts, 0.35f, -0.79f, 0.35f + rpmRatio * 0.56f, -0.72f,
-               rpmRatio > 0.82f ? 1.0f : 0.85f, rpmRatio > 0.82f ? 0.15f : 0.85f, 0.20f, 1.0f);
-    PushRect2D(hudVerts, 0.35f, -0.90f, 0.35f + nosRatio * 0.56f, -0.83f,
-               0.12f, 0.68f, 1.0f, 1.0f);
-
-    // Botões de Direção Esquerda / Direita + Acelerador + Nitro
-    bool steerLeftActive = (engine->touchSteer < -0.15f);
-    PushRect2D(hudVerts, -0.94f, -0.88f, -0.64f, -0.48f,
-               steerLeftActive ? 0.95f : 0.20f, steerLeftActive ? 0.65f : 0.24f, 0.12f, 0.75f);
-    bool steerRightActive = (engine->touchSteer > 0.15f);
-    PushRect2D(hudVerts, -0.58f, -0.88f, -0.28f, -0.48f,
-               steerRightActive ? 0.95f : 0.20f, steerRightActive ? 0.65f : 0.24f, 0.12f, 0.75f);
-    PushRect2D(hudVerts, 0.62f, -0.15f, 0.94f, 0.25f,
-               engine->touchNos ? 0.25f : 0.08f, engine->touchNos ? 0.85f : 0.42f, 1.0f, 0.80f);
-    bool gasActive = (engine->touchThrottle > 0.6f);
-    PushRect2D(hudVerts, 0.62f, -0.54f, 0.94f, -0.20f,
-               0.15f, gasActive ? 0.92f : 0.48f, 0.22f, 0.80f);
-
     Mat4 hudMvp = Mat4::Identity();
     glUniformMatrix4fv(engine->uMvpLoc, 1, GL_FALSE, hudMvp.m);
-    DrawMeshBuffer(engine, hudVerts, hudMvp, false);
+
+    // A) Barra Policial BUSTED / EVADE no Topo Central (PURSUIT_BACKING_TOP)
+    GLuint pursuitBarTex = engine->texMgr.Get("PURSUIT_BACKING_TOP");
+    std::vector<LitVertex> pbarVerts;
+    PushRect2D(pbarVerts, -0.46f, 0.83f, 0.46f, 0.94f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.90f);
+    DrawMeshBuffer(engine, pbarVerts, hudMvp, false, pursuitBarTex);
+
+    // Luzes estroboscópicas de perseguição no topo
+    bool hudFlash = (static_cast<int>(engine->animTime * 8.0f) % 2) == 0;
+    std::vector<LitVertex> strobeVerts;
+    PushRect2D(strobeVerts, -0.42f, 0.86f, -0.02f, 0.92f, 0, 0, 1, 1, hudFlash ? 0.95f : 0.20f, 0.10f, 0.10f, 0.85f);
+    PushRect2D(strobeVerts,  0.02f, 0.86f,  0.42f, 0.92f, 0, 0, 1, 1, 0.10f, 0.35f, hudFlash ? 0.20f : 0.98f, 0.85f);
+    DrawMeshBuffer(engine, strobeVerts, hudMvp, false, 0);
+
+    // B) Ícone de Bounty e Nível de Heat Policial (MAIN_ICON_BOUNTY)
+    GLuint bountyTex = engine->texMgr.Get("MAIN_ICON_BOUNTY");
+    std::vector<LitVertex> bountyVerts;
+    PushRect2D(bountyVerts, -0.95f, 0.82f, -0.84f, 0.95f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.70f, 0.15f, 1.0f);
+    DrawMeshBuffer(engine, bountyVerts, hudMvp, false, bountyTex);
+
+    int heat = static_cast<int>(engine->pursuit.GetCurrentHeat());
+    std::vector<LitVertex> heatVerts;
+    for (int h = 0; h < 5; ++h) {
+        float hx0 = -0.82f + h * 0.055f;
+        bool active = (h < heat);
+        PushRect2D(heatVerts, hx0, 0.85f, hx0 + 0.045f, 0.92f, 0, 0, 1, 1,
+                   active ? 1.0f : 0.22f, active ? 0.55f : 0.22f, active ? 0.10f : 0.22f, 1.0f);
+    }
+    DrawMeshBuffer(engine, heatVerts, hudMvp, false, 0);
+
+    // C) Selo de Autenticidade Black Edition BR no Topo Direito (Alternador M3 Race / Street)
+    std::vector<LitVertex> badgeVerts;
+    PushRect2D(badgeVerts, 0.58f, 0.83f, 0.95f, 0.94f, 0, 0, 1, 1,
+               engine->useStreetM3 ? 0.12f : 0.05f,
+               engine->useStreetM3 ? 0.75f : 0.42f,
+               engine->useStreetM3 ? 0.30f : 0.92f, 0.90f);
+    DrawMeshBuffer(engine, badgeVerts, hudMvp, false, 0);
+
+    // D) Tacômetro e Velocímetro Autêntico do NFS Most Wanted (Inferior Direito)
+    // Mostrador Circular com Números de RPM (8000_LINES_00)
+    GLuint tachLinesTex = engine->texMgr.Get("8000_LINES_00");
+    std::vector<LitVertex> dialVerts;
+    PushRect2D(dialVerts, 0.48f, -0.96f, 0.96f, -0.38f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.92f);
+    DrawMeshBuffer(engine, dialVerts, hudMvp, false, tachLinesTex);
+
+    // Ponteiro Giratório Laranja de RPM (TACH_NEEDLE_00)
+    GLuint needleTex = engine->texMgr.Get("TACH_NEEDLE_00");
+    float rpmRatio = std::clamp(engine->car.GetRPM() / 8500.0f, 0.0f, 1.0f);
+    // Ângulo do ponteiro: de -140 graus (0 RPM) a +90 graus (8500 RPM)
+    float needleAngleRad = (-140.0f + rpmRatio * 230.0f) * 3.14159265f / 180.0f;
+    float dialCenterX = 0.72f;
+    float dialCenterY = -0.67f;
+    float needleLen = 0.22f;
+    float nTipX = dialCenterX + std::cos(needleAngleRad) * needleLen;
+    float nTipY = dialCenterY + std::sin(needleAngleRad) * needleLen;
+    float nPerpX = -std::sin(needleAngleRad) * 0.02f;
+    float nPerpY =  std::cos(needleAngleRad) * 0.02f;
+
+    std::vector<LitVertex> needleVerts;
+    needleVerts.push_back({dialCenterX - nPerpX, dialCenterY - nPerpY, 0, 0, 1, 0, 0.0f, 1.0f, 1.0f, 0.35f, 0.05f, 1.0f});
+    needleVerts.push_back({dialCenterX + nPerpX, dialCenterY + nPerpY, 0, 0, 1, 0, 1.0f, 1.0f, 1.0f, 0.35f, 0.05f, 1.0f});
+    needleVerts.push_back({nTipX,                nTipY,                0, 0, 1, 0, 0.5f, 0.0f, 1.0f, 0.15f, 0.02f, 1.0f});
+    DrawMeshBuffer(engine, needleVerts, hudMvp, false, needleTex);
+
+    // Barras de Velocidade (KM/H) e Nitro (N2O)
+    float speedRatio = std::clamp(engine->car.GetSpeedKmh() / 320.0f, 0.0f, 1.0f);
+    float nosRatio   = std::clamp(engine->car.GetNosRemaining() / 100.0f, 0.0f, 1.0f);
+    std::vector<LitVertex> barVerts;
+    // Fundo das barras
+    PushRect2D(barVerts, 0.28f, -0.94f, 0.46f, -0.62f, 0, 0, 1, 1, 0.06f, 0.07f, 0.09f, 0.85f);
+    // Barra de Velocidade
+    PushRect2D(barVerts, 0.30f, -0.74f, 0.30f + speedRatio * 0.14f, -0.68f, 0, 0, 1, 1,
+               0.20f + speedRatio * 0.80f, 0.90f - speedRatio * 0.30f, 0.15f, 1.0f);
+    // Barra de Nitro
+    PushRect2D(barVerts, 0.30f, -0.86f, 0.30f + nosRatio * 0.14f, -0.80f, 0, 0, 1, 1,
+               0.15f, 0.70f, 1.0f, 1.0f);
+    DrawMeshBuffer(engine, barVerts, hudMvp, false, 0);
+
+    // E) Botões Virtuais de Direção Esquerda/Direita, Acelerador e Nitro
+    std::vector<LitVertex> btnVerts;
+    bool steerLeftActive = (engine->touchSteer < -0.15f);
+    PushRect2D(btnVerts, -0.94f, -0.88f, -0.64f, -0.48f, 0, 0, 1, 1,
+               steerLeftActive ? 0.95f : 0.20f, steerLeftActive ? 0.65f : 0.24f, 0.12f, 0.75f);
+    bool steerRightActive = (engine->touchSteer > 0.15f);
+    PushRect2D(btnVerts, -0.58f, -0.88f, -0.28f, -0.48f, 0, 0, 1, 1,
+               steerRightActive ? 0.95f : 0.20f, steerRightActive ? 0.65f : 0.24f, 0.12f, 0.75f);
+    PushRect2D(btnVerts, 0.62f, -0.15f, 0.94f, 0.25f, 0, 0, 1, 1,
+               engine->touchNos ? 0.25f : 0.08f, engine->touchNos ? 0.85f : 0.42f, 1.0f, 0.80f);
+    bool gasActive = (engine->touchThrottle > 0.6f);
+    PushRect2D(btnVerts, 0.62f, -0.54f, 0.94f, -0.20f, 0, 0, 1, 1,
+               0.15f, gasActive ? 0.92f : 0.48f, 0.22f, 0.80f);
+    DrawMeshBuffer(engine, btnVerts, hudMvp, false, 0);
 
     eglSwapBuffers(engine->display, engine->surface);
 }
@@ -934,12 +1155,10 @@ static int32_t HandleInput(struct android_app* app, AInputEvent* event) {
         if (flags == AMOTION_EVENT_ACTION_DOWN) {
             float tx = AMotionEvent_getX(event, 0);
             float ty = AMotionEvent_getY(event, 0);
-            // Topo esquerdo: muda o Heat Level Policial (1 a 5)
             if (tx < engine->width * 0.35f && ty < engine->height * 0.18f) {
                 int nextHeat = (static_cast<int>(engine->pursuit.GetCurrentHeat()) % 5) + 1;
                 engine->pursuit.SetHeatLevel(static_cast<HeatLevel>(nextHeat));
             }
-            // Topo direito: alterna entre os 2 modelos PS2 extraídos (BMWM3GTRE46 Race vs BMWM3 Street)
             if (tx > engine->width * 0.70f && ty < engine->height * 0.18f) {
                 engine->useStreetM3 = !engine->useStreetM3;
             }
@@ -1023,7 +1242,7 @@ void android_main(struct android_app* state) {
     state->onInputEvent = HandleInput;
     engine.app = state;
 
-    LOGI("NFS: Most Wanted - Black Edition (BR) Native Port iniciado!");
+    LOGI("NFS: Most Wanted - Black Edition (BR) Native Port v1.3.0 iniciado!");
 
     while (true) {
         int ident;
