@@ -26,30 +26,57 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. Aceitar Licenças e Garantir NDK + CMake
+      - name: 3. Aceitar Licenças e Garantir NDK + CMake + Build Tools
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653" "cmake;3.22.1"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653" "cmake;3.22.1" "build-tools;34.0.0"
 
       - name: 3.5. Recompor Pacote Mestre Completo do PS2 (2.05 GB)
         run: |
+          mkdir -p ps2_master_bundle/assets/ps2_data
           if [ -d "android/app/src/main/assets/ps2_data" ]; then
-            echo "Recompondo 2.05 GB de dados do PS2..."
-            cat android/app/src/main/assets/ps2_data/part_*.bin > android/app/src/main/assets/ps2_data/ZZDATA_FULL.BIN
-            rm -f android/app/src/main/assets/ps2_data/part_*.bin
-            ls -lh android/app/src/main/assets/ps2_data/ZZDATA_FULL.BIN
+            echo "Recompondo 2.05 GB de dados reais do PS2..."
+            cat android/app/src/main/assets/ps2_data/part_*.bin > ps2_master_bundle/assets/ps2_data/ZZDATA_FULL.BIN
+            rm -rf android/app/src/main/assets/ps2_data
+            ls -lh ps2_master_bundle/assets/ps2_data/ZZDATA_FULL.BIN
           fi
 
-      - name: 4. Compilar APK com Gradle
+      - name: 4. Compilar APK Base com Gradle
         run: |
           cd android
           gradle assembleDebug --stacktrace
 
+      - name: 4.5. Integrar Pacote Mestre 2.05 GB no APK, Alinhar e Assinar
+        run: |
+          echo "Integrando ZZDATA_FULL.BIN (2.05 GB) no APK..."
+          cd ps2_master_bundle
+          zip -0 -u ../android/app/build/outputs/apk/debug/app-debug.apk assets/ps2_data/ZZDATA_FULL.BIN
+          cd ..
+          
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          if [ ! -f "$BUILD_TOOLS/zipalign" ]; then
+            BUILD_TOOLS=$(find $ANDROID_HOME/build-tools -name zipalign | head -n 1 | xargs dirname)
+          fi
+          echo "Usando Build Tools em: $BUILD_TOOLS"
+          
+          # Alinhamento de 4 bytes para suporte a mmap de alta performance no Android
+          $BUILD_TOOLS/zipalign -f -p 4 android/app/build/outputs/apk/debug/app-debug.apk android/app/build/outputs/apk/debug/app-aligned.apk
+          
+          # Assinar com debug keystore oficial
+          $BUILD_TOOLS/apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android --key-pass pass:android --out android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk android/app/build/outputs/apk/debug/app-aligned.apk
+          
+          # Verificar a integridade da assinatura
+          $BUILD_TOOLS/apksigner verify --verbose android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk
+          
+          # Substituir app-debug.apk pelo APK completo de 2.06 GB
+          cp android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk android/app/build/outputs/apk/debug/app-debug.apk
+          ls -lh android/app/build/outputs/apk/debug/*.apk
+
       - name: 5. Publicar o APK como Artefato de Download
         uses: actions/upload-artifact@v4
         with:
-          name: NFS-Most-Wanted-Debug-APK
-          path: android/app/build/outputs/apk/debug/*.apk
+          name: NFS-Most-Wanted-Black-Edition-Full-2GB-APK
+          path: android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk
           retention-days: 14
 
       - name: 6. Criar Release Oficial no GitHub (se disparado por tag)
@@ -64,6 +91,6 @@ jobs:
             - **Pista Curva Realista de Rockport:** Rodovia sinuosa de alta velocidade, elevação montanhosa, barreiras de concreto contínuas, setas neon pulsantes e densas árvores de outono.
             - **HUD Completo:** Tacômetro circular de agulha original do Most Wanted, radar policial de varredura com projeção da curva da rodovia e blips policiais, e barra de perseguição Heat/Bounty.
             - **Tamanho do APK:** Superior a 2.0 GB uncompressed via aaptOptions para streaming e carregamento instantâneo.
-          files: android/app/build/outputs/apk/debug/*.apk
+          files: android/app/build/outputs/apk/debug/nfs_most_wanted_black_edition_ps2_full.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

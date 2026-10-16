@@ -18,7 +18,11 @@ android {
         }
 
         aaptOptions {
-            noCompress "BIN", "TPK", "img", "bun"
+            noCompress 'bin', 'BIN', 'tpk', 'TPK', 'img', 'bun'
+        }
+
+        androidResources {
+            noCompress 'bin', 'BIN', 'tpk', 'TPK', 'img', 'bun'
         }
 
         externalNativeBuild {
