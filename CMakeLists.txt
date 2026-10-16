@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(nfs_mw_android_port CXX)
+project(nfs_mw_android_port C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,9 @@ set(COMMON_SOURCES
 if(ANDROID)
     message(STATUS "Configurando para compilação nativa Android NDK (${ANDROID_ABI})")
     
+    # Força o linker a manter o símbolo ANativeActivity_onCreate exportado na .so
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -u ANativeActivity_onCreate")
+
     # Inclui o módulo oficial android_native_app_glue
     include_directories(${ANDROID_NDK}/sources/android/native_app_glue)
     

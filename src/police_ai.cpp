@@ -61,22 +61,32 @@ void PursuitSystem::Update(f32 dt, const Vector3& playerPos, const Vector3& play
     m_pursuitTimer += dt;
 
     int closeCops = 0;
-    for (auto& unit : m_activeUnits) {
+    for (size_t i = 0; i < m_activeUnits.size(); ++i) {
+        auto& unit = m_activeUnits[i];
         if (unit.state == COP_WRECKED) continue;
 
         // Vetor de aproximação até o jogador
-        f32 dx = playerPos.x - unit.position.x;
-        f32 dz = playerPos.z - unit.position.z;
+        f32 targetX = playerPos.x + ((i % 2 == 0) ? -2.2f : 2.2f);
+        f32 targetZ = playerPos.z - 6.0f - (static_cast<f32>(i) * 5.0f) + std::sin(m_pursuitTimer * 1.5f + i) * 4.0f;
+
+        f32 dx = targetX - unit.position.x;
+        f32 dz = targetZ - unit.position.z;
         f32 dist = std::sqrt(dx * dx + dz * dz);
 
-        if (dist < 15.0f) {
+        f32 distToPlayer = std::sqrt(
+            (playerPos.x - unit.position.x) * (playerPos.x - unit.position.x) +
+            (playerPos.z - unit.position.z) * (playerPos.z - unit.position.z)
+        );
+
+        if (distToPlayer < 18.0f) {
             closeCops++;
         }
 
-        // Tática de perseguição: acelerar na direção do jogador
-        f32 targetSpeed = 55.0f * unit.aggressionFactor; // m/s (~200 km/h)
-        unit.position.x += (dx / dist) * targetSpeed * 0.35f * dt;
-        unit.position.z += (dz / dist) * targetSpeed * dt;
+        if (dist > 0.001f) {
+            f32 catchup = std::min(dist * 3.5f, 75.0f * unit.aggressionFactor);
+            unit.position.x += (dx / dist) * catchup * 0.5f * dt;
+            unit.position.z += (dz / dist) * catchup * dt;
+        }
     }
 
     // Lógica do Medidor de Busted (Preso) vs Evaded (Fuga)

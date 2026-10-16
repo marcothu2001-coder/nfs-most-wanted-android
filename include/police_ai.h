@@ -53,6 +53,7 @@ public:
     f32 GetEvadeMeter() const { return m_evadeProgress; }
     bool IsPlayerBusted() const { return m_bustedProgress >= 100.0f; }
     bool IsPlayerEvaded() const { return m_evadeProgress >= 100.0f; }
+    const std::vector<PoliceUnit>& GetUnits() const { return m_activeUnits; }
 
 private:
     HeatLevel m_currentHeat = HEAT_1_PATROL;
