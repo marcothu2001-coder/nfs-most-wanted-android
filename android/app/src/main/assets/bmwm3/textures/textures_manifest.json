@@ -1,0 +1,82 @@
+[
+  {
+    "index": 0,
+    "hash": "0x019d1eaa",
+    "offset": 74560,
+    "size": 117,
+    "flags": "0x00000210",
+    "file": "texture_00_0x019d1eaa.bin"
+  },
+  {
+    "index": 1,
+    "hash": "0x2b9fda9d",
+    "offset": 68288,
+    "size": 118,
+    "flags": "0x00000210",
+    "file": "texture_01_0x2b9fda9d.bin"
+  },
+  {
+    "index": 2,
+    "hash": "0x58c20722",
+    "offset": 68416,
+    "size": 3046,
+    "flags": "0x00001110",
+    "file": "texture_02_0x58c20722.bin"
+  },
+  {
+    "index": 3,
+    "hash": "0x7e47fbb0",
+    "offset": 78016,
+    "size": 40215,
+    "flags": "0x000104d0",
+    "file": "texture_03_0x7e47fbb0.bin"
+  },
+  {
+    "index": 4,
+    "hash": "0x7e4bd238",
+    "offset": 118272,
+    "size": 14167,
+    "flags": "0x000044d0",
+    "file": "texture_04_0x7e4bd238.bin"
+  },
+  {
+    "index": 5,
+    "hash": "0x9f9b2d7b",
+    "offset": 68160,
+    "size": 124,
+    "flags": "0x00000210",
+    "file": "texture_05_0x9f9b2d7b.bin"
+  },
+  {
+    "index": 6,
+    "hash": "0xca4119b1",
+    "offset": 74688,
+    "size": 3299,
+    "flags": "0x00001110",
+    "file": "texture_06_0xca4119b1.bin"
+  },
+  {
+    "index": 7,
+    "hash": "0xd474bf30",
+    "offset": 896,
+    "size": 13063,
+    "flags": "0x000044d0",
+    "file": "texture_07_0xd474bf30.bin"
+  },
+  {
+    "index": 8,
+    "hash": "0xe6c1c1b0",
+    "offset": 14016,
+    "size": 54120,
+    "flags": "0x000104d0",
+    "file": "texture_08_0xe6c1c1b0.bin"
+  },
+  {
+    "index": 9,
+    "hash": "0xfaee9b64",
+    "offset": 71488,
+    "size": 3048,
+    "flags": "0x00001110",
+    "file": "texture_09_0xfaee9b64.bin"
+  }
+]

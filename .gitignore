@@ -1,16 +1,11 @@
-# Arquivos de imagem de disco e grandes binários do jogo (>100MB não cabem no GitHub)
+# Imagem ISO completa (>4GB) e executável bruto PS2
 *.iso
 *.ISO
 need/
-*.BIN
-*.bin
-*.BUN
-*.bun
-*.IMG
-*.img
+ZZDATA*.BIN
 SLUS_213.51
 
-# Diretórios de compilação
+# Diretórios de compilação e artefatos temporários
 build/
 .cxx/
 android/.gradle/
@@ -20,12 +15,17 @@ android/local.properties
 *.o
 *.so
 *.a
-*.obj
 *.exe
 *.apk
+*.zip
 
 # Arquivos temporários do Python e do SO
 __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
+
+# Manter explicitamente todos os ativos extraídos do Need for Speed: Most Wanted - Black Edition (BR)
+!ZDIR.BIN
+!extracted/**
+!android/app/src/main/assets/**
